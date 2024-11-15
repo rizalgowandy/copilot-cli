@@ -1,5 +1,4 @@
 //go:build integration
-// +build integration
 
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
@@ -8,8 +7,10 @@ package cloudformation_test
 
 import (
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,7 +27,11 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation"
+	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
+	"github.com/aws/copilot-cli/internal/pkg/deploy/upload/customresource"
+	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/template"
+	"github.com/aws/copilot-cli/internal/pkg/version"
 	"github.com/stretchr/testify/require"
 )
 
@@ -47,9 +52,10 @@ func Test_App_Infrastructure(t *testing.T) {
 	callerInfo, err := identity.Get()
 	require.NoError(t, err)
 	require.NoError(t, err)
-	deployer := cloudformation.New(sess)
+	deployer := cloudformation.New(sess, cloudformation.WithProgressTracker(os.Stderr))
 	cfClient := awsCF.New(sess)
 	require.NoError(t, err)
+	version.Version = "v1.28.0"
 
 	t.Run("Deploys Application Admin Roles to CloudFormation and Creates StackSet", func(t *testing.T) {
 		app := config.Application{Name: randStringBytes(10), AccountID: callerInfo.Account}
@@ -60,7 +66,7 @@ func Test_App_Infrastructure(t *testing.T) {
 		roleStackOutput, err := cfClient.DescribeStacks(&awsCF.DescribeStacksInput{
 			StackName: aws.String(appRoleStackName),
 		})
-
+		require.Error(t, err)
 		require.True(t, len(roleStackOutput.Stacks) == 0, "Stack %s should not exist.", appRoleStackName)
 
 		// Make sure we delete the stacks after the test is done
@@ -81,7 +87,7 @@ func Test_App_Infrastructure(t *testing.T) {
 		err = deployer.DeployApp(&deploy.CreateAppInput{
 			Name:      app.Name,
 			AccountID: app.AccountID,
-			Version:   deploy.LatestAppTemplateVersion,
+			Version:   version.LatestTemplateVersion(),
 		})
 		require.NoError(t, err)
 
@@ -116,8 +122,8 @@ func Test_App_Infrastructure(t *testing.T) {
 					fmt.Sprintf("AdministrationRoleARN should be named {app}-adminrole but was %s", *output.OutputValue))
 			},
 			"TemplateVersion": func(output *awsCF.Output) {
-				require.Equal(t, *output.OutputValue, deploy.LatestAppTemplateVersion,
-					fmt.Sprintf("TemplateVersion should be %s but was %s", deploy.LatestAppTemplateVersion, *output.OutputValue))
+				require.Equal(t, *output.OutputValue, version.LatestTemplateVersion(),
+					fmt.Sprintf("TemplateVersion should be %s but was %s", version.LatestTemplateVersion(), *output.OutputValue))
 			},
 		}
 		require.True(t, len(deployedStack.Outputs) == len(expectedResultsForKey),
@@ -171,13 +177,13 @@ func Test_App_Infrastructure(t *testing.T) {
 		roleStackOutput, err := cfClient.DescribeStacks(&awsCF.DescribeStacksInput{
 			StackName: aws.String(appRoleStackName),
 		})
-
+		require.Error(t, err)
 		require.True(t, len(roleStackOutput.Stacks) == 0, "Stack %s should not exist.", appRoleStackName)
 
 		err = deployer.DeployApp(&deploy.CreateAppInput{
 			Name:      app.Name,
 			AccountID: app.AccountID,
-			Version:   deploy.LatestAppTemplateVersion,
+			Version:   version.LatestTemplateVersion(),
 		})
 		require.NoError(t, err)
 
@@ -209,10 +215,11 @@ func Test_App_Infrastructure(t *testing.T) {
 			&cloudformation.AddEnvToAppOpts{
 				App:          &app,
 				EnvName:      "test",
-				EnvAccountID: "000312697014",
+				EnvAccountID: callerInfo.Account,
 				EnvRegion:    *sess.Config.Region,
 			},
 		)
+		require.NoError(t, err)
 
 		// Query using our GetRegionalAppResources function.
 		resources, err := deployer.GetRegionalAppResources(&app)
@@ -251,8 +258,8 @@ func Test_App_Infrastructure(t *testing.T) {
 					"PipelineBucket should not be nil")
 			},
 			"TemplateVersion": func(output *awsCF.Output) {
-				require.Equal(t, *output.OutputValue, deploy.LatestAppTemplateVersion,
-					fmt.Sprintf("TemplateVersion should be %s but was %s", deploy.LatestAppTemplateVersion, *output.OutputValue))
+				require.Equal(t, *output.OutputValue, version.LatestTemplateVersion(),
+					fmt.Sprintf("TemplateVersion should be %s but was %s", version.LatestTemplateVersion(), *output.OutputValue))
 			},
 			"ECRRepomysvc": func(output *awsCF.Output) {
 				require.True(t,
@@ -264,6 +271,12 @@ func Test_App_Infrastructure(t *testing.T) {
 				require.True(t,
 					strings.HasSuffix(*output.OutputValue, fmt.Sprintf("repository/%s/mysvc-frontend", app.Name)),
 					fmt.Sprintf("ECRRepomysvcDASHfrontend should be suffixed with repository/{app}/mysvc but was %s", *output.OutputValue))
+			},
+			"StackSetOpId": func(output *awsCF.Output) {
+				opID, err := strconv.Atoi(*output.OutputValue)
+				require.NoError(t, err)
+				require.GreaterOrEqual(t, opID, 1,
+					fmt.Sprintf("StackSetOpId should be > 1 but was %s", *output.OutputValue))
 			},
 		}
 		require.True(t, len(deployedStack.Outputs) == len(expectedResultsForKey),
@@ -327,7 +340,7 @@ func Test_App_Infrastructure(t *testing.T) {
 		err = deployer.DeployApp(&deploy.CreateAppInput{
 			Name:      app.Name,
 			AccountID: app.AccountID,
-			Version:   deploy.LatestAppTemplateVersion,
+			Version:   version.LatestTemplateVersion(),
 		})
 		require.NoError(t, err)
 
@@ -350,9 +363,10 @@ func Test_App_Infrastructure(t *testing.T) {
 		err = deployer.AddEnvToApp(&cloudformation.AddEnvToAppOpts{
 			App:          &app,
 			EnvName:      "test",
-			EnvAccountID: "000312697014",
+			EnvAccountID: callerInfo.Account,
 			EnvRegion:    *sess.Config.Region,
 		})
+		require.NoError(t, err)
 
 		stackInstances, err = cfClient.ListStackInstances(&awsCF.ListStackInstancesInput{
 			StackSetName: aws.String(appStackSetName),
@@ -375,76 +389,143 @@ func Test_App_Infrastructure(t *testing.T) {
 // is failing to be spun up because you've reached some limits, try
 // switching your default region by running aws configure.
 func Test_Environment_Deployment_Integration(t *testing.T) {
+	version.Version = "v1.28.0"
 	sess, err := testSession(nil)
 	require.NoError(t, err)
-	deployer := cloudformation.New(sess)
+	deployer := cloudformation.New(sess, cloudformation.WithProgressTracker(os.Stderr))
 	cfClient := awsCF.New(sess)
 	identity := identity.New(sess)
 	s3ManagerClient := s3manager.NewUploader(sess)
 	s3Client := awss3.New(sess)
-	uploader := template.New()
-
 	iamClient := iam.New(sess)
-
 	id, err := identity.Get()
 	require.NoError(t, err)
+
 	envName := randStringBytes(10)
 	appName := randStringBytes(10)
 	bucketName := randStringBytes(10)
-	environmentToDeploy := deploy.CreateEnvironmentInput{
+	environmentToDeploy := stack.EnvConfig{
 		Name: envName,
 		App: deploy.AppInformation{
 			Name:                appName,
 			AccountPrincipalARN: id.RootUserARN,
 		},
-		Version: deploy.LatestEnvTemplateVersion,
+		Version: version.LatestTemplateVersion(),
 	}
 	envStackName := fmt.Sprintf("%s-%s", environmentToDeploy.App.Name, environmentToDeploy.Name)
 
-	t.Run("Deploys an environment to CloudFormation", func(t *testing.T) {
-		// Given our stack doesn't exist
-		output, err := cfClient.DescribeStacks(&awsCF.DescribeStacksInput{
+	// Given our stack doesn't exist
+	output, err := cfClient.DescribeStacks(&awsCF.DescribeStacksInput{
+		StackName: aws.String(envStackName),
+	})
+	require.Error(t, err)
+	require.True(t, len(output.Stacks) == 0, "Stack %s should not exist.", envStackName)
+
+	// Create a temporary S3 bucket to store custom resource scripts.
+	_, err = s3ManagerClient.S3.CreateBucket(&s3.CreateBucketInput{
+		Bucket: aws.String(bucketName),
+	})
+	require.NoError(t, err)
+
+	// Make sure we delete the stack after the test is done.
+	defer func() {
+		_, err := cfClient.DeleteStack(&awsCF.DeleteStackInput{
 			StackName: aws.String(envStackName),
 		})
-		require.True(t, len(output.Stacks) == 0, "Stack %s should not exist.", envStackName)
+		require.NoError(t, err)
 
-		// Create a temporary S3 bucket to store custom resource scripts.
-		_, err = s3ManagerClient.S3.CreateBucket(&s3.CreateBucketInput{
+		err = deleteEnvRoles(appName, envName, id.Account, iamClient)
+		require.NoError(t, err)
+
+		err = s3Client.EmptyBucket(bucketName)
+		require.NoError(t, err)
+		_, err = s3ManagerClient.S3.DeleteBucket(&s3.DeleteBucketInput{
 			Bucket: aws.String(bucketName),
 		})
 		require.NoError(t, err)
+	}()
 
-		// Make sure we delete the stack after the test is done
-		defer func() {
-			_, err := cfClient.DeleteStack(&awsCF.DeleteStackInput{
-				StackName: aws.String(envStackName),
-			})
-			require.NoError(t, err)
+	t.Run("Deploys bootstrap resources for the environment to CloudFormation", func(t *testing.T) {
+		bucketARN := fmt.Sprintf("arn:aws:s3:::%s", bucketName)
+		environmentToDeploy.ArtifactBucketKeyARN = "arn:aws:kms:us-west-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+		environmentToDeploy.ArtifactBucketARN = bucketARN
 
-			err = deleteEnvRoles(appName, envName, id.Account, iamClient)
-			require.NoError(t, err)
+		// Deploy the environment and wait for it to be complete
+		require.NoError(t, deployer.CreateAndRenderEnvironment(stack.NewBootstrapEnvStackConfig(&environmentToDeploy), bucketARN))
 
-			err = s3Client.EmptyBucket(bucketName)
-			require.NoError(t, err)
-			_, err = s3ManagerClient.S3.DeleteBucket(&s3.DeleteBucketInput{
-				Bucket: aws.String(bucketName),
-			})
-			require.NoError(t, err)
-		}()
+		// Ensure that the new stack exists
+		output, err := cfClient.DescribeStacks(&awsCF.DescribeStacksInput{
+			StackName: aws.String(envStackName),
+		})
+		require.NoError(t, err)
+		require.True(t, len(output.Stacks) == 1, "Stack %s should have been deployed.", envStackName)
 
-		urls, err := uploader.UploadEnvironmentCustomResources(awss3.CompressAndUploadFunc(func(key string, objects ...awss3.NamedBinary) (string, error) {
-			return s3Client.ZipAndUpload(bucketName, key, objects...)
-		}))
+		deployedStack := output.Stacks[0]
+		expectedResultsForKey := map[string]func(*awsCF.Output){
+			"EnvironmentManagerRoleARN": func(output *awsCF.Output) {
+				require.Equal(t,
+					fmt.Sprintf("%s-EnvironmentManagerRoleARN", envStackName),
+					*output.ExportName,
+					"Should export EnvironmentManagerRole ARN")
+
+				require.True(t,
+					strings.HasSuffix(*output.OutputValue, fmt.Sprintf("role/%s-EnvManagerRole", envStackName)),
+					"EnvironmentManagerRole ARN value should not be nil.")
+			},
+			"CFNExecutionRoleARN": func(output *awsCF.Output) {
+				require.Equal(t,
+					fmt.Sprintf("%s-CFNExecutionRoleARN", envStackName),
+					*output.ExportName,
+					"Should export CRNExecutionRole ARN")
+
+				require.True(t,
+					strings.HasSuffix(*output.OutputValue, fmt.Sprintf("role/%s-CFNExecutionRole", envStackName)),
+					"CRNExecutionRole ARN value should not be nil.")
+			},
+		}
+		require.True(t, len(deployedStack.Outputs) == len(expectedResultsForKey),
+			"There should have been %d output values - instead there were %d. The value of the CF stack was %s",
+			len(expectedResultsForKey),
+			len(deployedStack.Outputs),
+			deployedStack.GoString(),
+		)
+		for _, output := range deployedStack.Outputs {
+			key := *output.OutputKey
+			validationFunction := expectedResultsForKey[key]
+			require.NotNil(t, validationFunction, "Unexpected output key %s in stack.", key)
+			validationFunction(output)
+		}
+	})
+
+	t.Run("Deploys an environment to CloudFormation", func(t *testing.T) {
+		crs, err := customresource.Env(template.New())
+		require.NoError(t, err)
+		urls, err := customresource.Upload(func(key string, dat io.Reader) (url string, err error) {
+			return s3Client.Upload(bucketName, key, dat)
+		}, crs)
 		require.NoError(t, err)
 		environmentToDeploy.CustomResourcesURLs = urls
 		environmentToDeploy.ArtifactBucketKeyARN = "arn:aws:kms:us-west-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"
-		environmentToDeploy.ArtifactBucketARN = "arn:aws:s3:::fakebucket/key"
+		environmentToDeploy.ArtifactBucketARN = fmt.Sprintf("arn:aws:s3:::%s", bucketName)
+		environmentToDeploy.Mft = &manifest.Environment{
+			Workload: manifest.Workload{
+				Name: aws.String(envName),
+				Type: aws.String("Environment"),
+			},
+		}
 
-		// Deploy the environment and wait for it to be complete
-		require.NoError(t, deployer.DeployAndRenderEnvironment(os.Stderr, &environmentToDeploy))
+		// Deploy the environment and wait for it to be complete.
+		oldParams, err := deployer.DeployedEnvironmentParameters(environmentToDeploy.App.Name, environmentToDeploy.Name)
+		require.NoError(t, err)
+		lastForceUpdateID, err := deployer.ForceUpdateOutputID(environmentToDeploy.App.Name, environmentToDeploy.Name)
+		require.NoError(t, err)
+		conf, err := stack.NewEnvConfigFromExistingStack(&environmentToDeploy, lastForceUpdateID, oldParams)
+		require.NoError(t, err)
+		// Deploy the environment and wait for it to be complete.
+		require.NoError(t, deployer.UpdateAndRenderEnvironment(conf, environmentToDeploy.ArtifactBucketARN, false))
 
-		// Ensure that the new stack exists
-		output, err = cfClient.DescribeStacks(&awsCF.DescribeStacksInput{
+		// Ensure that the updated stack still exists.
+		output, err := cfClient.DescribeStacks(&awsCF.DescribeStacksInput{
 			StackName: aws.String(envStackName),
 		})
 		require.NoError(t, err)
@@ -453,7 +534,7 @@ func Test_Environment_Deployment_Integration(t *testing.T) {
 		deployedStack := output.Stacks[0]
 		expectedResultsForKey := map[string]func(*awsCF.Output){
 			"EnabledFeatures": func(output *awsCF.Output) {
-				require.Equal(t, ",,", aws.StringValue(output.OutputValue), "no env features enabled by default")
+				require.Equal(t, ",,,,,", aws.StringValue(output.OutputValue), "no env features enabled by default")
 			},
 			"EnvironmentManagerRoleARN": func(output *awsCF.Output) {
 				require.Equal(t,
@@ -554,6 +635,9 @@ func Test_Environment_Deployment_Integration(t *testing.T) {
 				require.NotNil(t,
 					output.OutputValue,
 					"EnvironmentSecurityGroup value should not be nil")
+			},
+			"LastForceDeployID": func(output *awsCF.Output) {
+				require.Equal(t, lastForceUpdateID, aws.StringValue(output.OutputValue), "last force update id does not change by default")
 			},
 		}
 		require.True(t, len(deployedStack.Outputs) == len(expectedResultsForKey),

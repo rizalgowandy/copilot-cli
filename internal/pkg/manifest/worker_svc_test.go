@@ -4,12 +4,12 @@
 package manifest
 
 import (
-	"io/ioutil"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
+	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
@@ -30,6 +30,27 @@ func newMockSQSQueue() SQSQueue {
 	}
 }
 
+func newMockSQSFIFOQueueOrBool() SQSQueueOrBool {
+	return SQSQueueOrBool{
+		Advanced: newMockSQSFIFOQueue(),
+	}
+}
+
+func newMockSQSFIFOQueue() SQSQueue {
+	duration111Seconds := 111 * time.Second
+	return SQSQueue{
+		Retention:  &duration111Seconds,
+		Delay:      &duration111Seconds,
+		Timeout:    &duration111Seconds,
+		DeadLetter: DeadLetterQueue{Tries: aws.Uint16(10)},
+		FIFO: FIFOAdvanceConfigOrBool{
+			Advanced: FIFOAdvanceConfig{
+				FIFOThroughputLimit: aws.String("perMessageID"),
+			},
+		},
+	}
+}
+
 func TestNewWorkerSvc(t *testing.T) {
 	testCases := map[string]struct {
 		inProps WorkerServiceProps
@@ -41,19 +62,24 @@ func TestNewWorkerSvc(t *testing.T) {
 				WorkloadProps: WorkloadProps{
 					Name:       "testers",
 					Dockerfile: "./testers/Dockerfile",
+					PrivateOnlyEnvironments: []string{
+						"metrics",
+					},
 				},
 			},
 			wantedManifest: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("testers"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Build: BuildArgsOrString{
-								BuildArgs: DockerBuildArgs{
-									Dockerfile: aws.String("./testers/Dockerfile"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildArgs: DockerBuildArgs{
+										Dockerfile: aws.String("./testers/Dockerfile"),
+									},
 								},
 							},
 						},
@@ -71,7 +97,20 @@ func TestNewWorkerSvc(t *testing.T) {
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement: placementP(PublicSubnetPlacement),
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
+						},
+					},
+				},
+				Environments: map[string]*WorkerServiceConfig{
+					"metrics": {
+						Network: NetworkConfig{
+							VPC: vpcConfig{
+								Placement: PlacementArgOrString{
+									PlacementString: placementStringP(PrivateSubnetPlacement),
+								},
+							},
 						},
 					},
 				},
@@ -87,14 +126,16 @@ func TestNewWorkerSvc(t *testing.T) {
 			wantedManifest: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("testers"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Build: BuildArgsOrString{
-								BuildArgs: DockerBuildArgs{
-									Dockerfile: aws.String("./testers/Dockerfile"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildArgs: DockerBuildArgs{
+										Dockerfile: aws.String("./testers/Dockerfile"),
+									},
 								},
 							},
 						},
@@ -112,7 +153,232 @@ func TestNewWorkerSvc(t *testing.T) {
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement: placementP(PublicSubnetPlacement),
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
+						},
+					},
+				},
+			},
+		},
+		"should return a worker service instance with 2 subscriptions to the default fifo queue and 2 standard topic specific queues": {
+			inProps: WorkerServiceProps{
+				WorkloadProps: WorkloadProps{
+					Name:       "testers",
+					Dockerfile: "./testers/Dockerfile",
+				},
+				Topics: []TopicSubscription{
+					{
+						Name:    aws.String("fifoTopic1.fifo"),
+						Service: aws.String("fifoService1"),
+					},
+					{
+						Name:    aws.String("fifoTopic2.fifo"),
+						Service: aws.String("fifoService2"),
+					},
+					{
+						Name:    aws.String("standardTopic1"),
+						Service: aws.String("standardService1"),
+					},
+					{
+						Name:    aws.String("standardTopic2"),
+						Service: aws.String("standardService2"),
+					},
+				},
+			},
+			wantedManifest: &WorkerService{
+				Workload: Workload{
+					Name: aws.String("testers"),
+					Type: aws.String(manifestinfo.WorkerServiceType),
+				},
+				WorkerServiceConfig: WorkerServiceConfig{
+					ImageConfig: ImageWithHealthcheck{
+						Image: Image{
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildArgs: DockerBuildArgs{
+										Dockerfile: aws.String("./testers/Dockerfile"),
+									},
+								},
+							},
+						},
+					},
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("fifoTopic1"),
+								Service: aws.String("fifoService1"),
+							},
+							{
+								Name:    aws.String("fifoTopic2"),
+								Service: aws.String("fifoService2"),
+							},
+							{
+								Name:    aws.String("standardTopic1"),
+								Service: aws.String("standardService1"),
+								Queue:   SQSQueueOrBool{Enabled: aws.Bool(true)},
+							},
+							{
+								Name:    aws.String("standardTopic2"),
+								Service: aws.String("standardService2"),
+								Queue:   SQSQueueOrBool{Enabled: aws.Bool(true)},
+							},
+						},
+						Queue: SQSQueue{
+							FIFO: FIFOAdvanceConfigOrBool{Enable: aws.Bool(true)},
+						},
+					},
+					TaskConfig: TaskConfig{
+						CPU:    aws.Int(256),
+						Memory: aws.Int(512),
+						Count: Count{
+							Value: aws.Int(1),
+						},
+						ExecuteCommand: ExecuteCommand{
+							Enable: aws.Bool(false),
+						},
+					},
+					Network: NetworkConfig{
+						VPC: vpcConfig{
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
+						},
+					},
+				},
+			},
+		},
+		"should return a worker service instance with 2 subscriptions to the default fifo queue": {
+			inProps: WorkerServiceProps{
+				WorkloadProps: WorkloadProps{
+					Name:       "testers",
+					Dockerfile: "./testers/Dockerfile",
+				},
+				Topics: []TopicSubscription{
+					{
+						Name:    aws.String("fifoTopic1.fifo"),
+						Service: aws.String("fifoService1"),
+					},
+					{
+						Name:    aws.String("fifoTopic2.fifo"),
+						Service: aws.String("fifoService2"),
+					},
+				},
+			},
+			wantedManifest: &WorkerService{
+				Workload: Workload{
+					Name: aws.String("testers"),
+					Type: aws.String(manifestinfo.WorkerServiceType),
+				},
+				WorkerServiceConfig: WorkerServiceConfig{
+					ImageConfig: ImageWithHealthcheck{
+						Image: Image{
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildArgs: DockerBuildArgs{
+										Dockerfile: aws.String("./testers/Dockerfile"),
+									},
+								},
+							},
+						},
+					},
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("fifoTopic1"),
+								Service: aws.String("fifoService1"),
+							},
+							{
+								Name:    aws.String("fifoTopic2"),
+								Service: aws.String("fifoService2"),
+							},
+						},
+						Queue: SQSQueue{
+							FIFO: FIFOAdvanceConfigOrBool{Enable: aws.Bool(true)},
+						},
+					},
+					TaskConfig: TaskConfig{
+						CPU:    aws.Int(256),
+						Memory: aws.Int(512),
+						Count: Count{
+							Value: aws.Int(1),
+						},
+						ExecuteCommand: ExecuteCommand{
+							Enable: aws.Bool(false),
+						},
+					},
+					Network: NetworkConfig{
+						VPC: vpcConfig{
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
+						},
+					},
+				},
+			},
+		},
+		"should return a worker service instance with 2 subscriptions to the default standard queue": {
+			inProps: WorkerServiceProps{
+				WorkloadProps: WorkloadProps{
+					Name:       "testers",
+					Dockerfile: "./testers/Dockerfile",
+				},
+				Topics: []TopicSubscription{
+					{
+						Name:    aws.String("standardTopic1"),
+						Service: aws.String("standardService1"),
+					},
+					{
+						Name:    aws.String("standardTopic2"),
+						Service: aws.String("standardService2"),
+					},
+				},
+			},
+			wantedManifest: &WorkerService{
+				Workload: Workload{
+					Name: aws.String("testers"),
+					Type: aws.String(manifestinfo.WorkerServiceType),
+				},
+				WorkerServiceConfig: WorkerServiceConfig{
+					ImageConfig: ImageWithHealthcheck{
+						Image: Image{
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildArgs: DockerBuildArgs{
+										Dockerfile: aws.String("./testers/Dockerfile"),
+									},
+								},
+							},
+						},
+					},
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("standardTopic1"),
+								Service: aws.String("standardService1"),
+							},
+							{
+								Name:    aws.String("standardTopic2"),
+								Service: aws.String("standardService2"),
+							},
+						},
+						Queue: SQSQueue{},
+					},
+					TaskConfig: TaskConfig{
+						CPU:    aws.Int(256),
+						Memory: aws.Int(512),
+						Count: Count{
+							Value: aws.Int(1),
+						},
+						ExecuteCommand: ExecuteCommand{
+							Enable: aws.Bool(false),
+						},
+					},
+					Network: NetworkConfig{
+						VPC: vpcConfig{
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
 						},
 					},
 				},
@@ -135,87 +401,24 @@ func TestNewWorkerSvc(t *testing.T) {
 	}
 }
 
-func TestWorkerSvc_MarshalBinary(t *testing.T) {
-	testCases := map[string]struct {
-		inProps WorkerServiceProps
-
-		wantedTestdata string
-	}{
-		"without subscribe": {
-			inProps: WorkerServiceProps{
-				WorkloadProps: WorkloadProps{
-					Name:       "testers",
-					Dockerfile: "./testers/Dockerfile",
-				},
-				Platform: PlatformArgsOrString{
-					PlatformString: nil,
-					PlatformArgs: PlatformArgs{
-						OSFamily: nil,
-						Arch:     nil,
-					},
-				},
-			},
-			wantedTestdata: "worker-svc-nosubscribe.yml",
-		},
-		"with subscribe": {
-			inProps: WorkerServiceProps{
-				WorkloadProps: WorkloadProps{
-					Name:       "testers",
-					Dockerfile: "./testers/Dockerfile",
-				},
-				Platform: PlatformArgsOrString{
-					PlatformString: nil,
-					PlatformArgs: PlatformArgs{
-						OSFamily: nil,
-						Arch:     nil,
-					},
-				},
-				Topics: []TopicSubscription{
-					{
-						Name:    aws.String("testTopic"),
-						Service: aws.String("service4TestTopic"),
-					},
-					{
-						Name:    aws.String("testTopic2"),
-						Service: aws.String("service4TestTopic2"),
-					},
-				},
-			},
-			wantedTestdata: "worker-svc-subscribe.yml",
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			// GIVEN
-			path := filepath.Join("testdata", tc.wantedTestdata)
-			wantedBytes, err := ioutil.ReadFile(path)
-			require.NoError(t, err)
-			manifest := NewWorkerService(tc.inProps)
-
-			// WHEN
-			tpl, err := manifest.MarshalBinary()
-			require.NoError(t, err)
-
-			// THEN
-			require.Equal(t, string(wantedBytes), string(tpl))
-		})
-	}
-}
-
 func TestWorkerSvc_ApplyEnv(t *testing.T) {
-	mockPerc := Percentage(70)
+	perc := Percentage(70)
+	mockConfig := ScalingConfigOrT[Percentage]{
+		Value: &perc,
+	}
 	mockWorkerServiceWithNoEnvironments := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			ImageConfig: ImageWithHealthcheck{
 				Image: Image{
-					Build: BuildArgsOrString{
-						BuildArgs: DockerBuildArgs{
-							Dockerfile: aws.String("./Dockerfile"),
+					ImageLocationOrBuild: ImageLocationOrBuild{
+						Build: BuildArgsOrString{
+							BuildArgs: DockerBuildArgs{
+								Dockerfile: aws.String("./Dockerfile"),
+							},
 						},
 					},
 				},
@@ -279,8 +482,10 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			},
 			Sidecars: map[string]*SidecarConfig{
 				"xray": {
-					Port:  aws.String("2000/udp"),
-					Image: aws.String("123456789012.dkr.ecr.us-east-2.amazonaws.com/xray-daemon"),
+					Port: aws.String("2000/udp"),
+					Image: Union[*string, ImageLocationOrBuild]{
+						Basic: aws.String("123456789012.dkr.ecr.us-east-2.amazonaws.com/xray-daemon"),
+					},
 				},
 			},
 			Logging: Logging{
@@ -310,12 +515,16 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 				TaskConfig: TaskConfig{
 					Count: Count{
 						AdvancedCount: AdvancedCount{
-							CPU: &mockPerc,
+							CPU: mockConfig,
 						},
 					},
 					CPU: aws.Int(512),
-					Variables: map[string]string{
-						"LOG_LEVEL": "",
+					Variables: map[string]Variable{
+						"LOG_LEVEL": {
+							StringOrFromCFN{
+								Plain: stringP(""),
+							},
+						},
 					},
 				},
 				Sidecars: map[string]*SidecarConfig{
@@ -343,14 +552,16 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 	mockWorkerServiceWithImageOverrideBuildByLocation := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			ImageConfig: ImageWithHealthcheck{
 				Image: Image{
-					Build: BuildArgsOrString{
-						BuildArgs: DockerBuildArgs{
-							Dockerfile: aws.String("./Dockerfile"),
+					ImageLocationOrBuild: ImageLocationOrBuild{
+						Build: BuildArgsOrString{
+							BuildArgs: DockerBuildArgs{
+								Dockerfile: aws.String("./Dockerfile"),
+							},
 						},
 					},
 				},
@@ -360,7 +571,9 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			"prod-iad": {
 				ImageConfig: ImageWithHealthcheck{
 					Image: Image{
-						Location: aws.String("env-override location"),
+						ImageLocationOrBuild: ImageLocationOrBuild{
+							Location: aws.String("env-override location"),
+						},
 					},
 				},
 			},
@@ -369,12 +582,14 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 	mockWorkerServiceWithImageOverrideLocationByLocation := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			ImageConfig: ImageWithHealthcheck{
 				Image: Image{
-					Location: aws.String("original location"),
+					ImageLocationOrBuild: ImageLocationOrBuild{
+						Location: aws.String("original location"),
+					},
 				},
 			},
 		},
@@ -382,7 +597,9 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			"prod-iad": {
 				ImageConfig: ImageWithHealthcheck{
 					Image: Image{
-						Location: aws.String("env-override location"),
+						ImageLocationOrBuild: ImageLocationOrBuild{
+							Location: aws.String("env-override location"),
+						},
 					},
 				},
 			},
@@ -391,15 +608,17 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 	mockWorkerServiceWithImageOverrideBuildByBuild := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			ImageConfig: ImageWithHealthcheck{
 				Image: Image{
-					Build: BuildArgsOrString{
-						BuildArgs: DockerBuildArgs{
-							Dockerfile: aws.String("original dockerfile"),
-							Context:    aws.String("original context"),
+					ImageLocationOrBuild: ImageLocationOrBuild{
+						Build: BuildArgsOrString{
+							BuildArgs: DockerBuildArgs{
+								Dockerfile: aws.String("original dockerfile"),
+								Context:    aws.String("original context"),
+							},
 						},
 					},
 				},
@@ -409,8 +628,10 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			"prod-iad": {
 				ImageConfig: ImageWithHealthcheck{
 					Image: Image{
-						Build: BuildArgsOrString{
-							BuildString: aws.String("env overridden dockerfile"),
+						ImageLocationOrBuild: ImageLocationOrBuild{
+							Build: BuildArgsOrString{
+								BuildString: aws.String("env overridden dockerfile"),
+							},
 						},
 					},
 				},
@@ -420,12 +641,14 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 	mockWorkerServiceWithImageOverrideLocationByBuild := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			ImageConfig: ImageWithHealthcheck{
 				Image: Image{
-					Location: aws.String("original location"),
+					ImageLocationOrBuild: ImageLocationOrBuild{
+						Location: aws.String("original location"),
+					},
 				},
 			},
 		},
@@ -433,8 +656,10 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			"prod-iad": {
 				ImageConfig: ImageWithHealthcheck{
 					Image: Image{
-						Build: BuildArgsOrString{
-							BuildString: aws.String("env overridden dockerfile"),
+						ImageLocationOrBuild: ImageLocationOrBuild{
+							Build: BuildArgsOrString{
+								BuildString: aws.String("env overridden dockerfile"),
+							},
 						},
 					},
 				},
@@ -444,7 +669,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 	mockWorkerServiceWithSubscribeNilOverride := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			Subscribe: SubscribeConfig{
@@ -466,7 +691,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 	mockWorkerServiceWithNilSubscribeOverride := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			Subscribe: SubscribeConfig{},
@@ -488,7 +713,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 	mockWorkerServiceWithEmptySubscribeOverride := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			Subscribe: SubscribeConfig{
@@ -510,7 +735,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 	mockWorkerServiceWithSubscribeTopicNilOverride := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			Subscribe: SubscribeConfig{
@@ -534,7 +759,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 	mockWorkerServiceWithNilSubscribeTopicOverride := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			Subscribe: SubscribeConfig{
@@ -558,7 +783,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 	mockWorkerServiceWithSubscribeTopicEmptyOverride := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			Subscribe: SubscribeConfig{
@@ -582,7 +807,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 	mockWorkerServiceWithSubscribeQueueNilOverride := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			Subscribe: SubscribeConfig{
@@ -600,7 +825,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 	mockWorkerServiceWithNilSubscribeQueueOverride := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			Subscribe: SubscribeConfig{
@@ -618,7 +843,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 	mockWorkerServiceWithSubscribeQueueEmptyOverride := WorkerService{
 		Workload: Workload{
 			Name: aws.String("phonetool"),
-			Type: aws.String(WorkerServiceType),
+			Type: aws.String(manifestinfo.WorkerServiceType),
 		},
 		WorkerServiceConfig: WorkerServiceConfig{
 			Subscribe: SubscribeConfig{
@@ -685,17 +910,23 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 						Memory: aws.Int(256),
 						Count: Count{
 							AdvancedCount: AdvancedCount{
-								CPU: &mockPerc,
+								CPU: mockConfig,
 							},
 						},
-						Variables: map[string]string{
-							"LOG_LEVEL": "",
+						Variables: map[string]Variable{
+							"LOG_LEVEL": {
+								StringOrFromCFN{
+									Plain: stringP(""),
+								},
+							},
 						},
 					},
 					Sidecars: map[string]*SidecarConfig{
 						"xray": {
-							Port:       aws.String("2000/udp"),
-							Image:      aws.String("123456789012.dkr.ecr.us-east-2.amazonaws.com/xray-daemon"),
+							Port: aws.String("2000/udp"),
+							Image: Union[*string, ImageLocationOrBuild]{
+								Basic: aws.String("123456789012.dkr.ecr.us-east-2.amazonaws.com/xray-daemon"),
+							},
 							CredsParam: aws.String("some arn"),
 						},
 					},
@@ -725,12 +956,14 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			wanted: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Location: aws.String("env-override location"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Location: aws.String("env-override location"),
+							},
 						},
 					},
 				},
@@ -744,12 +977,14 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			wanted: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Location: aws.String("env-override location"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Location: aws.String("env-override location"),
+							},
 						},
 					},
 				},
@@ -762,13 +997,15 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			wanted: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Build: BuildArgsOrString{
-								BuildString: aws.String("env overridden dockerfile"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildString: aws.String("env overridden dockerfile"),
+								},
 							},
 						},
 					},
@@ -782,13 +1019,15 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			wanted: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Build: BuildArgsOrString{
-								BuildString: aws.String("env overridden dockerfile"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildString: aws.String("env overridden dockerfile"),
+								},
 							},
 						},
 					},
@@ -802,7 +1041,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			wanted: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					Subscribe: SubscribeConfig{
@@ -825,7 +1064,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			wanted: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					Subscribe: SubscribeConfig{
@@ -848,7 +1087,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			wanted: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					ImageConfig: ImageWithHealthcheck{
@@ -874,7 +1113,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			wanted: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					Subscribe: SubscribeConfig{
@@ -897,7 +1136,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			wanted: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					Subscribe: SubscribeConfig{
@@ -920,7 +1159,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			wanted: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					ImageConfig: ImageWithHealthcheck{
@@ -946,7 +1185,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			wanted: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					Subscribe: SubscribeConfig{
@@ -963,7 +1202,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			wanted: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					Subscribe: SubscribeConfig{
@@ -980,7 +1219,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 			wanted: &WorkerService{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(WorkerServiceType),
+					Type: aws.String(manifestinfo.WorkerServiceType),
 				},
 				WorkerServiceConfig: WorkerServiceConfig{
 					ImageConfig: ImageWithHealthcheck{
@@ -998,7 +1237,7 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			got, _ := tc.svc.ApplyEnv(tc.inEnvName)
+			got, _ := tc.svc.applyEnv(tc.inEnvName)
 
 			// Should override properly.
 			require.Equal(t, tc.wanted, got)
@@ -1010,7 +1249,10 @@ func TestWorkerSvc_ApplyEnv(t *testing.T) {
 
 func TestWorkerSvc_ApplyEnv_CountOverrides(t *testing.T) {
 	mockRange := IntRangeBand("1-10")
-	mockPerc := Percentage(80)
+	perc := Percentage(70)
+	mockConfig := ScalingConfigOrT[Percentage]{
+		Value: &perc,
+	}
 	testCases := map[string]struct {
 		svcCount Count
 		envCount Count
@@ -1021,7 +1263,7 @@ func TestWorkerSvc_ApplyEnv_CountOverrides(t *testing.T) {
 			svcCount: Count{
 				AdvancedCount: AdvancedCount{
 					Range: Range{Value: &mockRange},
-					CPU:   &mockPerc,
+					CPU:   mockConfig,
 				},
 			},
 			envCount: Count{},
@@ -1031,7 +1273,7 @@ func TestWorkerSvc_ApplyEnv_CountOverrides(t *testing.T) {
 						Count: Count{
 							AdvancedCount: AdvancedCount{
 								Range: Range{Value: &mockRange},
-								CPU:   &mockPerc,
+								CPU:   mockConfig,
 							},
 						},
 					},
@@ -1161,7 +1403,7 @@ func TestWorkerSvc_ApplyEnv_CountOverrides(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			// WHEN
-			actual, _ := svc.ApplyEnv("test")
+			actual, _ := svc.applyEnv("test")
 
 			// THEN
 			require.Equal(t, tc.expected, actual)
@@ -1250,6 +1492,420 @@ func TestSQSQueueOrBool_UnmarshalYAML(t *testing.T) {
 				require.Equal(t, tc.wantedStruct.Advanced.Retention, sc.Queue.Advanced.Retention)
 				require.Equal(t, tc.wantedStruct.Advanced.Timeout, sc.Queue.Advanced.Timeout)
 			}
+		})
+	}
+}
+
+func TestWorkerService_RequiredEnvironmentFeatures(t *testing.T) {
+	testCases := map[string]struct {
+		mft    func(svc *WorkerService)
+		wanted []string
+	}{
+		"no feature required by default": {
+			mft: func(svc *WorkerService) {},
+		},
+		"nat feature required": {
+			mft: func(svc *WorkerService) {
+				svc.Network = NetworkConfig{
+					VPC: vpcConfig{
+						Placement: PlacementArgOrString{
+							PlacementString: placementStringP(PrivateSubnetPlacement),
+						},
+					},
+				}
+			},
+			wanted: []string{template.NATFeatureName},
+		},
+		"efs feature required by enabling managed volume": {
+			mft: func(svc *WorkerService) {
+				svc.Storage = Storage{
+					Volumes: map[string]*Volume{
+						"mock-managed-volume-1": {
+							EFS: EFSConfigOrBool{
+								Enabled: aws.Bool(true),
+							},
+						},
+						"mock-imported-volume": {
+							EFS: EFSConfigOrBool{
+								Advanced: EFSVolumeConfiguration{
+									FileSystemID: StringOrFromCFN{Plain: aws.String("mock-id")},
+								},
+							},
+						},
+					},
+				}
+			},
+			wanted: []string{template.EFSFeatureName},
+		},
+		"efs feature not required because storage is imported": {
+			mft: func(svc *WorkerService) {
+				svc.Storage = Storage{
+					Volumes: map[string]*Volume{
+						"mock-imported-volume": {
+							EFS: EFSConfigOrBool{
+								Advanced: EFSVolumeConfiguration{
+									FileSystemID: StringOrFromCFN{Plain: aws.String("mock-id")},
+								},
+							},
+						},
+					},
+				}
+			},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			inSvc := WorkerService{
+				Workload: Workload{
+					Name: aws.String("mock-svc"),
+					Type: aws.String(manifestinfo.WorkerServiceType),
+				},
+			}
+			tc.mft(&inSvc)
+			got := inSvc.requiredEnvironmentFeatures()
+			require.Equal(t, tc.wanted, got)
+		})
+	}
+}
+
+func TestWorkerService_Subscriptions(t *testing.T) {
+	duration111Seconds := 111 * time.Second
+	testCases := map[string]struct {
+		input    *WorkerService
+		expected *WorkerService
+	}{
+		"empty subscription": {
+			input: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{},
+				},
+			},
+			expected: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{},
+				},
+			},
+		},
+		"valid subscribe with one topic specific standard queue and a default standard queue": {
+			input: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name"),
+								Service: aws.String("svc"),
+								Queue:   newMockSQSQueueOrBool(),
+							},
+						},
+					},
+				},
+			},
+			expected: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name"),
+								Service: aws.String("svc"),
+								Queue: SQSQueueOrBool{
+									Advanced: SQSQueue{
+										Retention:  &duration111Seconds,
+										Delay:      &duration111Seconds,
+										Timeout:    &duration111Seconds,
+										DeadLetter: DeadLetterQueue{Tries: aws.Uint16(10)},
+									},
+								},
+							},
+						},
+						Queue: SQSQueue{},
+					},
+				},
+			},
+		},
+		"valid subscribe with one topic specific fifo queue and a default standard queue": {
+			input: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name"),
+								Service: aws.String("svc"),
+								Queue:   newMockSQSFIFOQueueOrBool(),
+							},
+						},
+					},
+				},
+			},
+			expected: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name.fifo"),
+								Service: aws.String("svc"),
+								Queue:   newMockSQSFIFOQueueOrBool(),
+							},
+						},
+						Queue: SQSQueue{},
+					},
+				},
+			},
+		},
+		"valid subscribe with no topic specific standard queue but with default standard queue with empty config": {
+			input: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name"),
+								Service: aws.String("svc"),
+							},
+						},
+					},
+				},
+			},
+			expected: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name"),
+								Service: aws.String("svc"),
+							},
+						},
+						Queue: SQSQueue{},
+					},
+				},
+			},
+		},
+		"valid subscribe with no topic specific standard queue but with default standard queue with minimal config": {
+			input: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name"),
+								Service: aws.String("svc"),
+							},
+						},
+						Queue: newMockSQSQueue(),
+					},
+				},
+			},
+			expected: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name"),
+								Service: aws.String("svc"),
+							},
+						},
+						Queue: SQSQueue{
+							Retention:  &duration111Seconds,
+							Delay:      &duration111Seconds,
+							Timeout:    &duration111Seconds,
+							DeadLetter: DeadLetterQueue{Tries: aws.Uint16(10)},
+						},
+					},
+				},
+			},
+		},
+		"valid subscribe with no topic specific fifo queue but with default fifo queue with minimal config": {
+			input: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name"),
+								Service: aws.String("svc"),
+							},
+						},
+						Queue: newMockSQSFIFOQueue(),
+					},
+				},
+			},
+			expected: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name.fifo"),
+								Service: aws.String("svc"),
+							},
+						},
+						Queue: newMockSQSFIFOQueue(),
+					},
+				},
+			},
+		},
+		"valid subscribe with one topic specific standard queue and another subscription for the default fifo queue": {
+
+			input: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name"),
+								Service: aws.String("svc"),
+								Queue:   newMockSQSQueueOrBool(),
+							},
+							{
+								Name:    aws.String("name2"),
+								Service: aws.String("svc"),
+							},
+						},
+						Queue: newMockSQSFIFOQueue(),
+					},
+				},
+			},
+			expected: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name"),
+								Service: aws.String("svc"),
+								Queue: SQSQueueOrBool{
+									Advanced: SQSQueue{
+										Retention:  &duration111Seconds,
+										Delay:      &duration111Seconds,
+										Timeout:    &duration111Seconds,
+										DeadLetter: DeadLetterQueue{Tries: aws.Uint16(10)},
+									},
+								},
+							},
+							{
+								Name:    aws.String("name2.fifo"),
+								Service: aws.String("svc"),
+							},
+						},
+						Queue: newMockSQSFIFOQueue(),
+					},
+				},
+			},
+		},
+		"valid subscribe with one topic specific fifo queue and another subscription for the default standard queue": {
+
+			input: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name"),
+								Service: aws.String("svc"),
+							},
+							{
+								Name:    aws.String("name2"),
+								Service: aws.String("svc"),
+								Queue:   newMockSQSFIFOQueueOrBool(),
+							},
+						},
+					},
+				},
+			},
+			expected: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					Subscribe: SubscribeConfig{
+						Topics: []TopicSubscription{
+							{
+								Name:    aws.String("name"),
+								Service: aws.String("svc"),
+							},
+							{
+								Name:    aws.String("name2.fifo"),
+								Service: aws.String("svc"),
+								Queue:   newMockSQSFIFOQueueOrBool(),
+							},
+						},
+						Queue: SQSQueue{},
+					},
+				},
+			},
+		},
+	}
+	for name, tc := range testCases {
+		svc := tc.input
+
+		t.Run(name, func(t *testing.T) {
+			// WHEN
+			svc.Subscribe.Topics = svc.Subscriptions()
+
+			// THEN
+			require.Equal(t, tc.expected, svc)
+		})
+	}
+}
+
+func TestWorkerService_Dockerfile(t *testing.T) {
+	testCases := map[string]struct {
+		input                  *WorkerService
+		expectedDockerfilePath string
+	}{
+		"specific dockerfile from buildargs": {
+			input: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					ImageConfig: ImageWithHealthcheck{
+						Image: Image{
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildArgs: DockerBuildArgs{
+										Dockerfile: aws.String("path/to/Dockerfile"),
+									},
+									BuildString: aws.String("other/path/to/Dockerfile"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedDockerfilePath: "path/to/Dockerfile",
+		},
+		"specific dockerfile from buildstring": {
+			input: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					ImageConfig: ImageWithHealthcheck{
+						Image: Image{
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildString: aws.String("path/to/Dockerfile"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedDockerfilePath: "path/to/Dockerfile",
+		},
+		"dockerfile from context": {
+			input: &WorkerService{
+				WorkerServiceConfig: WorkerServiceConfig{
+					ImageConfig: ImageWithHealthcheck{
+						Image: Image{
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildArgs: DockerBuildArgs{
+										Context: aws.String("path/to"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedDockerfilePath: "path/to/Dockerfile",
+		},
+	}
+
+	for name, tc := range testCases {
+		svc := tc.input
+
+		t.Run(name, func(t *testing.T) {
+			// WHEN
+			dockerfilePath := svc.Dockerfile()
+
+			// THEN
+			require.Equal(t, tc.expectedDockerfilePath, dockerfilePath)
 		})
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
+	"github.com/spf13/afero"
 
 	"github.com/aws/copilot-cli/internal/pkg/cli/list"
 	"github.com/aws/copilot-cli/internal/pkg/config"
@@ -35,7 +36,7 @@ type listSvcOpts struct {
 }
 
 func newListSvcOpts(vars listWkldVars) (*listSvcOpts, error) {
-	ws, err := workspace.New()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +60,7 @@ func newListSvcOpts(vars listWkldVars) (*listSvcOpts, error) {
 		listWkldVars: vars,
 
 		list: svcLister,
-		sel:  selector.NewSelect(prompt.New(), store),
+		sel:  selector.NewAppEnvSelector(prompt.New(), store),
 	}, nil
 }
 
@@ -76,7 +77,7 @@ func (o *listSvcOpts) Ask() error {
 		return nil
 	}
 
-	name, err := o.sel.Application(svcAppNamePrompt, svcAppNameHelpPrompt)
+	name, err := o.sel.Application(svcAppNamePrompt, wkldAppNameHelpPrompt)
 	if err != nil {
 		return fmt.Errorf("select application name: %w", err)
 	}

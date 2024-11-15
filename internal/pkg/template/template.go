@@ -15,40 +15,42 @@ import (
 	"text/template"
 
 	"github.com/aws/copilot-cli/internal/pkg/aws/s3"
+	"github.com/aws/copilot-cli/internal/pkg/template/artifactpath"
 )
 
-//go:embed templates
+//go:embed templates templates/overrides/cdk/.gitignore
 var templateFS embed.FS
 
 // File names under "templates/".
 const (
 	DNSCertValidatorFileName            = "dns-cert-validator"
+	CertReplicatorFileName              = "cert-replicator"
 	DNSDelegationFileName               = "dns-delegation"
 	CustomDomainFileName                = "custom-domain"
 	AppRunnerCustomDomainLambdaFileName = "custom-domain-app-runner"
-	NLBCertValidatorLambdaFileName      = "nlb-cert-validator"
-	NLBCustomDomainLambdaFileName       = "nlb-custom-domain"
 
 	customResourceRootPath         = "custom-resources"
 	customResourceZippedScriptName = "index.js"
 	scriptDirName                  = "scripts"
 )
 
+// AddonsStackLogicalID is the logical ID for the addon stack resource in the main template.
+const AddonsStackLogicalID = "AddonsStack"
+
 // Groups of files that belong to the same stack.
 var (
 	envCustomResourceFiles = []string{
 		DNSCertValidatorFileName,
+		CertReplicatorFileName,
 		DNSDelegationFileName,
 		CustomDomainFileName,
 	}
-	rdWkldCustomResourceFiles = []string{
-		AppRunnerCustomDomainLambdaFileName,
-	}
-	nlbWkldCustomResourceFiles = []string{
-		NLBCertValidatorLambdaFileName,
-		NLBCustomDomainLambdaFileName,
-	}
 )
+
+// Reader is the interface that wraps the Read method.
+type Reader interface {
+	Read(path string) (*Content, error)
+}
 
 // Parser is the interface that wraps the Parse method.
 type Parser interface {
@@ -57,7 +59,7 @@ type Parser interface {
 
 // ReadParser is the interface that wraps the Read and Parse methods.
 type ReadParser interface {
-	Read(path string) (*Content, error)
+	Reader
 	Parser
 }
 
@@ -83,9 +85,14 @@ type fileToCompress struct {
 	uploadables []Uploadable
 }
 
+type osFS interface {
+	fs.ReadDirFS
+	fs.ReadFileFS
+}
+
 // Template represents the "/templates/" directory that holds static files to be embedded in the binary.
 type Template struct {
-	fs fs.ReadFileFS
+	fs osFS
 }
 
 // New returns a Template object that can be used to parse files under the "/templates/" directory.
@@ -114,7 +121,7 @@ func (t *Template) Parse(path string, data interface{}, options ...ParseOption) 
 	}
 	buf := new(bytes.Buffer)
 	if err := tpl.Execute(buf, data); err != nil {
-		return nil, fmt.Errorf("execute template %s with data %v: %w", path, data, err)
+		return nil, fmt.Errorf("execute template %s: %w", path, err)
 	}
 	return &Content{buf}, nil
 }
@@ -122,16 +129,6 @@ func (t *Template) Parse(path string, data interface{}, options ...ParseOption) 
 // UploadEnvironmentCustomResources uploads the environment custom resource scripts.
 func (t *Template) UploadEnvironmentCustomResources(upload s3.CompressAndUploadFunc) (map[string]string, error) {
 	return t.uploadCustomResources(upload, envCustomResourceFiles)
-}
-
-// UploadRequestDrivenWebServiceCustomResources uploads the request driven web service custom resource scripts.
-func (t *Template) UploadRequestDrivenWebServiceCustomResources(upload s3.CompressAndUploadFunc) (map[string]string, error) {
-	return t.uploadCustomResources(upload, rdWkldCustomResourceFiles)
-}
-
-// UploadLoadBalancedWebServiceNLBCustomResources uploads the network load-balanced web service custom resource scripts.
-func (t *Template) UploadNetworkLoadBalancedWebServiceCustomResources(upload s3.CompressAndUploadFunc) (map[string]string, error) {
-	return t.uploadCustomResources(upload, nlbWkldCustomResourceFiles)
 }
 
 func (t *Template) uploadCustomResources(upload s3.CompressAndUploadFunc, fileNames []string) (map[string]string, error) {
@@ -166,10 +163,10 @@ func (t *Template) uploadFileToCompress(upload s3.CompressAndUploadFunc, file fi
 		contents = append(contents, uploadable.content...)
 		nameBinaries = append(nameBinaries, uploadable)
 	}
-	// Suffix with a SHA256 checksum of the fileToCompress so that
-	// only new content gets a new URL. Otherwise, if two fileToCompresss have the
+	// Prefix with a SHA256 checksum of the fileToCompress so that
+	// only new content gets a new URL. Otherwise, if two fileToCompress have the
 	// same content then the URL generated will be identical.
-	url, err := upload(s3.MkdirSHA256(file.name, contents), nameBinaries...)
+	url, err := upload(artifactpath.MkdirSHA256(file.name, contents), nameBinaries...)
 	if err != nil {
 		return "", fmt.Errorf("upload %s: %w", file.name, err)
 	}
@@ -241,4 +238,35 @@ func (t *Template) parse(name, path string, options ...ParseOption) (*template.T
 		return nil, fmt.Errorf("parse template %s: %w", path, err)
 	}
 	return parsedTpl, nil
+}
+
+// WalkDirFunc is the type of the function called by any Walk functions while visiting each file under a directory.
+type WalkDirFunc func(name string, content *Content) error
+
+func (t *Template) walkDir(basePath, curPath string, data any, fn WalkDirFunc, parseOpts ...ParseOption) error {
+	entries, err := t.fs.ReadDir(path.Join("templates", curPath))
+	if err != nil {
+		return fmt.Errorf("read dir %q: %w", curPath, err)
+	}
+	for _, entry := range entries {
+		targetPath := path.Join(curPath, entry.Name())
+		if entry.IsDir() {
+			if err := t.walkDir(basePath, targetPath, data, fn); err != nil {
+				return err
+			}
+			continue
+		}
+		content, err := t.Parse(targetPath, data, parseOpts...)
+		if err != nil {
+			return err
+		}
+		relPath, err := filepath.Rel(basePath, targetPath)
+		if err != nil {
+			return err
+		}
+		if err := fn(relPath, content); err != nil {
+			return err
+		}
+	}
+	return nil
 }

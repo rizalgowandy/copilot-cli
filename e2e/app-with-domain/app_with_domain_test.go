@@ -4,21 +4,21 @@
 package app_with_domain_test
 
 import (
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"github.com/aws/copilot-cli/e2e/internal/client"
 )
 
 var _ = Describe("App With Domain", func() {
-	const domainName = "copilot-e2e-tests.ecs.aws.dev"
-
-	Context("when creating a new app", func() {
+	Context("when creating a new app", Ordered, func() {
 		var appInitErr error
 
 		BeforeAll(func() {
@@ -48,10 +48,10 @@ var _ = Describe("App With Domain", func() {
 		})
 	})
 
-	Context("when creating new environments", func() {
+	Context("when adding new environments", func() {
 		fatalErrors := make(chan error)
 		wgDone := make(chan bool)
-		It("env init should succeed for creating test and prod environments", func() {
+		It("env init should succeed for adding test and prod environments", func() {
 			var wg sync.WaitGroup
 			wg.Add(2)
 			go func() {
@@ -60,8 +60,7 @@ var _ = Describe("App With Domain", func() {
 					content, err := cli.EnvInit(&client.EnvInitRequest{
 						AppName: appName,
 						EnvName: "test",
-						Profile: "default",
-						Prod:    false,
+						Profile: "test",
 					})
 					if err == nil {
 						break
@@ -78,8 +77,7 @@ var _ = Describe("App With Domain", func() {
 					content, err := cli.EnvInit(&client.EnvInitRequest{
 						AppName: appName,
 						EnvName: "prod",
-						Profile: prodEnvironmentProfile,
-						Prod:    false,
+						Profile: "prod",
 					})
 					if err == nil {
 						break
@@ -104,6 +102,46 @@ var _ = Describe("App With Domain", func() {
 		})
 	})
 
+	Context("when deploying the environments", func() {
+		fatalErrors := make(chan error)
+		wgDone := make(chan bool)
+		It("env deploy should succeed for deploying test and prod environments", func() {
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				_, err := cli.EnvDeploy(&client.EnvDeployRequest{
+					AppName: appName,
+					Name:    "test",
+				})
+				if err != nil {
+					fatalErrors <- err
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				_, err := cli.EnvDeploy(&client.EnvDeployRequest{
+					AppName: appName,
+					Name:    "prod",
+				})
+				if err != nil {
+					fatalErrors <- err
+				}
+			}()
+			go func() {
+				wg.Wait()
+				close(wgDone)
+				close(fatalErrors)
+			}()
+
+			select {
+			case <-wgDone:
+			case err := <-fatalErrors:
+				Expect(err).NotTo(HaveOccurred())
+			}
+		})
+	})
+
 	Context("when initializing Load Balanced Web Services", func() {
 		var svcInitErr error
 
@@ -112,7 +150,7 @@ var _ = Describe("App With Domain", func() {
 				Name:       "hello",
 				SvcType:    "Load Balanced Web Service",
 				Dockerfile: "./src/Dockerfile",
-				SvcPort:    "80",
+				SvcPort:    "3000",
 			})
 			Expect(svcInitErr).NotTo(HaveOccurred())
 		})
@@ -122,7 +160,7 @@ var _ = Describe("App With Domain", func() {
 				Name:       "frontend",
 				SvcType:    "Load Balanced Web Service",
 				Dockerfile: "./src/Dockerfile",
-				SvcPort:    "80",
+				SvcPort:    "3000",
 			})
 			Expect(svcInitErr).NotTo(HaveOccurred())
 		})
@@ -211,8 +249,8 @@ var _ = Describe("App With Domain", func() {
 			Expect(len(svc.Routes)).To(Equal(2))
 
 			wantedURLs := map[string]string{
-				"test": "https://test.copilot-e2e-tests.ecs.aws.dev",
-				"prod": "https://prod.copilot-e2e-tests.ecs.aws.dev",
+				"test": fmt.Sprintf("https://test.%s", domainName),
+				"prod": fmt.Sprintf("https://prod.%s", domainName),
 			}
 			for _, route := range svc.Routes {
 				// Validate route has the expected HTTPS endpoint.
@@ -240,7 +278,7 @@ var _ = Describe("App With Domain", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(len(svc.Routes)).To(Equal(1))
 			wantedURLs = map[string]string{
-				"test": "https://frontend.copilot-e2e-tests.ecs.aws.dev or https://copilot-e2e-tests.ecs.aws.dev",
+				"test": fmt.Sprintf("https://%s or https://frontend.%s", domainName, domainName),
 			}
 			// Validate route has the expected HTTPS endpoint.
 			route := svc.Routes[0]
@@ -250,9 +288,42 @@ var _ = Describe("App With Domain", func() {
 			var resp *http.Response
 			var fetchErr error
 			urls := strings.Split(route.URL, " or ")
+			expectedRootResponseBody := "This is Copilot express app"
+			expectedAdminResponseBody := "This is Copilot express app for admin"
 			for _, url := range urls {
 				Eventually(func() (int, error) {
 					resp, fetchErr = http.Get(url)
+					if fetchErr != nil {
+						return 0, fetchErr
+					}
+					defer resp.Body.Close()
+					body, err := io.ReadAll(resp.Body)
+					if err != nil {
+						return 0, err
+					}
+					if string(body) != expectedRootResponseBody {
+						return 0, fmt.Errorf("the message content is %q, but expected %q", string(body), expectedRootResponseBody)
+					}
+					return resp.StatusCode, fetchErr
+				}, "60s", "1s").Should(Equal(200))
+				// HTTP should route to HTTPS.
+				Eventually(func() (int, error) {
+					resp, fetchErr = http.Get(strings.Replace(url, "https", "http", 1))
+					return resp.StatusCode, fetchErr
+				}, "60s", "1s").Should(Equal(200))
+				Eventually(func() (int, error) {
+					resp, fetchErr = http.Get(fmt.Sprintf("%s/admin", url))
+					if fetchErr != nil {
+						return 0, fetchErr
+					}
+					defer resp.Body.Close()
+					body, err := io.ReadAll(resp.Body)
+					if err != nil {
+						return 0, err
+					}
+					if string(body) != expectedAdminResponseBody {
+						return 0, fmt.Errorf("the message content is %q, but expected %q", string(body), expectedAdminResponseBody)
+					}
 					return resp.StatusCode, fetchErr
 				}, "60s", "1s").Should(Equal(200))
 				// HTTP should route to HTTPS.

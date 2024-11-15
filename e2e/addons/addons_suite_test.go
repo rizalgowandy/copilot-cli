@@ -9,12 +9,11 @@ import (
 	"time"
 
 	"github.com/aws/copilot-cli/e2e/internal/client"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 var cli *client.CLI
-var aws *client.AWS
 var (
 	appName string
 	svcName string
@@ -39,9 +38,6 @@ var _ = BeforeSuite(func() {
 	cli = ecsCli
 	Expect(err).NotTo(HaveOccurred())
 
-	awsCli := client.NewAWS()
-	aws = awsCli
-
 	appName = fmt.Sprintf("e2e-addons-%d", time.Now().Unix())
 	svcName = "hello"
 
@@ -56,16 +52,6 @@ var _ = BeforeSuite(func() {
 
 var _ = AfterSuite(func() {
 	_, err := cli.AppDelete()
+	_ = client.NewAWS().DeleteAllDBClusterSnapshots()
 	Expect(err).NotTo(HaveOccurred())
-	_ = aws.DeleteAllDBClusterSnapshots()
 })
-
-func BeforeAll(fn func()) {
-	first := true
-	BeforeEach(func() {
-		if first {
-			fn()
-			first = false
-		}
-	})
-}

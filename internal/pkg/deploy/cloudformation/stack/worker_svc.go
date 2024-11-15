@@ -5,24 +5,18 @@ package stack
 
 import (
 	"fmt"
+	"strings"
+
+	"github.com/aws/copilot-cli/internal/pkg/deploy/upload/customresource"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/cloudformation"
-	"github.com/aws/copilot-cli/internal/pkg/addon"
+	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/aws/copilot-cli/internal/pkg/template/override"
 )
-
-// Template rendering configuration.
-const (
-	backlogCalculatorLambdaPath = "custom-resources/backlog-per-task-calculator.js"
-)
-
-type workerSvcReadParser interface {
-	template.ReadParser
-	ParseWorkerService(template.WorkloadOpts) (*template.Content, error)
-}
 
 // WorkerService represents the configuration needed to create a CloudFormation stack from a worker service manifest.
 type WorkerService struct {
@@ -32,47 +26,56 @@ type WorkerService struct {
 	parser workerSvcReadParser
 }
 
+// WorkerServiceConfig contains data required to initialize a scheduled job stack.
+type WorkerServiceConfig struct {
+	App                *config.Application
+	Env                string
+	Manifest           *manifest.WorkerService
+	ArtifactBucketName string
+	ArtifactKey        string
+	RawManifest        string
+	RuntimeConfig      RuntimeConfig
+	Addons             NestedStackConfigurer
+}
+
 // NewWorkerService creates a new WorkerService stack from a manifest file.
-func NewWorkerService(mft *manifest.WorkerService, env, app string, rc RuntimeConfig) (*WorkerService, error) {
-	parser := template.New()
-	addons, err := addon.New(aws.StringValue(mft.Name))
+func NewWorkerService(cfg WorkerServiceConfig) (*WorkerService, error) {
+	crs, err := customresource.Worker(fs)
 	if err != nil {
-		return nil, fmt.Errorf("new addons: %w", err)
+		return nil, fmt.Errorf("worker service custom resources: %w", err)
 	}
+	cfg.RuntimeConfig.loadCustomResourceURLs(cfg.ArtifactBucketName, uploadableCRs(crs).convert())
+
 	return &WorkerService{
 		ecsWkld: &ecsWkld{
 			wkld: &wkld{
-				name:   aws.StringValue(mft.Name),
-				env:    env,
-				app:    app,
-				rc:     rc,
-				image:  mft.ImageConfig.Image,
-				parser: parser,
-				addons: addons,
+				name:               aws.StringValue(cfg.Manifest.Name),
+				env:                cfg.Env,
+				app:                cfg.App.Name,
+				permBound:          cfg.App.PermissionsBoundary,
+				artifactBucketName: cfg.ArtifactBucketName,
+				artifactKey:        cfg.ArtifactKey,
+				rc:                 cfg.RuntimeConfig,
+				image:              cfg.Manifest.ImageConfig.Image,
+				rawManifest:        cfg.RawManifest,
+				parser:             fs,
+				addons:             cfg.Addons,
 			},
-			logRetention:        mft.Logging.Retention,
-			tc:                  mft.TaskConfig,
+			logging:             cfg.Manifest.Logging,
+			sidecars:            cfg.Manifest.Sidecars,
+			tc:                  cfg.Manifest.TaskConfig,
 			taskDefOverrideFunc: override.CloudFormationTemplate,
 		},
-		manifest: mft,
-
-		parser: parser,
+		manifest: cfg.Manifest,
+		parser:   fs,
 	}, nil
 }
 
 // Template returns the CloudFormation template for the worker service.
 func (s *WorkerService) Template() (string, error) {
-	desiredCountLambda, err := s.parser.Read(desiredCountGeneratorPath)
+	crs, err := convertCustomResources(s.rc.CustomResourcesURL)
 	if err != nil {
-		return "", fmt.Errorf("read desired count lambda function source code: %w", err)
-	}
-	envControllerLambda, err := s.parser.Read(envControllerPath)
-	if err != nil {
-		return "", fmt.Errorf("read env controller lambda function source code: %w", err)
-	}
-	backlogPerTaskLambda, err := s.parser.Read(backlogCalculatorLambdaPath)
-	if err != nil {
-		return "", fmt.Errorf("read backlog-per-task-calculator lambda function source code: %w", err)
+		return "", err
 	}
 	addonsParams, err := s.addonsParameters()
 	if err != nil {
@@ -82,7 +85,11 @@ func (s *WorkerService) Template() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sidecars, err := convertSidecar(s.manifest.Sidecars)
+	exposedPorts, err := s.manifest.ExposedPorts()
+	if err != nil {
+		return "", fmt.Errorf("parse exposed ports in service manifest %s: %w", s.name, err)
+	}
+	sidecars, err := convertSidecars(s.manifest.Sidecars, exposedPorts.PortsForContainer, s.rc)
 	if err != nil {
 		return "", fmt.Errorf("convert the sidecar configuration for service %s: %w", s.name, err)
 	}
@@ -100,6 +107,7 @@ func (s *WorkerService) Template() (string, error) {
 		desiredCountOnSpot = advancedCount.Spot
 		capacityProviders = advancedCount.Cps
 	}
+
 	entrypoint, err := convertEntryPoint(s.manifest.EntryPoint)
 	if err != nil {
 		return "", err
@@ -108,7 +116,7 @@ func (s *WorkerService) Template() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	subscribe, err := convertSubscribe(s.manifest.Subscribe)
+	subscribe, err := convertSubscribe(s.manifest)
 	if err != nil {
 		return "", err
 	}
@@ -116,42 +124,56 @@ func (s *WorkerService) Template() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf(`convert "publish" field for service %s: %w`, s.name, err)
 	}
+	scOpts := template.ServiceConnectOpts{
+		Server: convertServiceConnectServer(s.manifest.Network.Connect, nil),
+		Client: s.manifest.Network.Connect.Enabled(),
+	}
 	content, err := s.parser.ParseWorkerService(template.WorkloadOpts{
-		Variables:                      s.manifest.WorkerServiceConfig.Variables,
-		Secrets:                        convertSecrets(s.manifest.WorkerServiceConfig.Secrets),
-		NestedStack:                    addonsOutputs,
-		AddonsExtraParams:              addonsParams,
-		Sidecars:                       sidecars,
-		Autoscaling:                    autoscaling,
-		CapacityProviders:              capacityProviders,
-		DesiredCountOnSpot:             desiredCountOnSpot,
-		ExecuteCommand:                 convertExecuteCommand(&s.manifest.ExecuteCommand),
-		WorkloadType:                   manifest.WorkerServiceType,
-		HealthCheck:                    convertContainerHealthCheck(s.manifest.WorkerServiceConfig.ImageConfig.HealthCheck),
-		LogConfig:                      convertLogging(s.manifest.Logging),
-		DockerLabels:                   s.manifest.ImageConfig.Image.DockerLabels,
-		DesiredCountLambda:             desiredCountLambda.String(),
-		EnvControllerLambda:            envControllerLambda.String(),
-		BacklogPerTaskCalculatorLambda: backlogPerTaskLambda.String(),
-		Storage:                        convertStorageOpts(s.manifest.Name, s.manifest.Storage),
-		Network:                        convertNetworkConfig(s.manifest.Network),
-		EntryPoint:                     entrypoint,
-		Command:                        command,
-		DependsOn:                      convertDependsOn(s.manifest.ImageConfig.Image.DependsOn),
-		CredentialsParameter:           aws.StringValue(s.manifest.ImageConfig.Image.Credentials),
-		ServiceDiscoveryEndpoint:       s.rc.ServiceDiscoveryEndpoint,
-		Subscribe:                      subscribe,
-		Publish:                        publishers,
-		Platform:                       convertPlatform(s.manifest.Platform),
+		AppName:                  s.app,
+		EnvName:                  s.env,
+		WorkloadName:             s.name,
+		SerializedManifest:       string(s.rawManifest),
+		EnvVersion:               s.rc.EnvVersion,
+		Version:                  s.rc.Version,
+		Variables:                convertEnvVars(s.manifest.WorkerServiceConfig.Variables),
+		Secrets:                  convertSecrets(s.manifest.WorkerServiceConfig.Secrets),
+		NestedStack:              addonsOutputs,
+		AddonsExtraParams:        addonsParams,
+		Sidecars:                 sidecars,
+		Autoscaling:              autoscaling,
+		CapacityProviders:        capacityProviders,
+		DesiredCountOnSpot:       desiredCountOnSpot,
+		ExecuteCommand:           convertExecuteCommand(&s.manifest.ExecuteCommand),
+		WorkloadType:             manifestinfo.WorkerServiceType,
+		HealthCheck:              convertContainerHealthCheck(s.manifest.WorkerServiceConfig.ImageConfig.HealthCheck),
+		LogConfig:                convertLogging(s.manifest.Logging),
+		DockerLabels:             s.manifest.ImageConfig.Image.DockerLabels,
+		CustomResources:          crs,
+		Storage:                  convertStorageOpts(s.manifest.Name, s.manifest.Storage),
+		Network:                  convertNetworkConfig(s.manifest.Network),
+		DeploymentConfiguration:  convertWorkerDeploymentConfig(s.manifest.WorkerServiceConfig.DeployConfig),
+		EntryPoint:               entrypoint,
+		ServiceConnectOpts:       scOpts,
+		Command:                  command,
+		DependsOn:                convertDependsOn(s.manifest.ImageConfig.Image.DependsOn),
+		CredentialsParameter:     aws.StringValue(s.manifest.ImageConfig.Image.Credentials),
+		ServiceDiscoveryEndpoint: s.rc.ServiceDiscoveryEndpoint,
+		Subscribe:                subscribe,
+		Publish:                  publishers,
+		Platform:                 convertPlatform(s.manifest.Platform),
+		Observability: template.ObservabilityOpts{
+			Tracing: strings.ToUpper(aws.StringValue(s.manifest.Observability.Tracing)),
+		},
+		PermissionsBoundary: s.permBound,
 	})
 	if err != nil {
 		return "", fmt.Errorf("parse worker service template: %w", err)
 	}
-	overridenTpl, err := s.taskDefOverrideFunc(convertTaskDefOverrideRules(s.manifest.TaskDefOverrides), content.Bytes())
+	overriddenTpl, err := s.taskDefOverrideFunc(convertTaskDefOverrideRules(s.manifest.TaskDefOverrides), content.Bytes())
 	if err != nil {
 		return "", fmt.Errorf("apply task definition overrides: %w", err)
 	}
-	return string(overridenTpl), nil
+	return string(overriddenTpl), nil
 }
 
 // Parameters returns the list of CloudFormation parameters used by the template.
@@ -160,14 +182,10 @@ func (s *WorkerService) Parameters() ([]*cloudformation.Parameter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append(wkldParams, &cloudformation.Parameter{
-		ParameterKey:   aws.String(WorkloadEnvFileARNParamKey),
-		ParameterValue: aws.String(s.rc.EnvFileARN),
-	}), nil
+	return wkldParams, nil
 }
 
-// SerializedParameters returns the CloudFormation stack's parameters serialized
-// to a YAML document annotated with comments for readability to users.
+// SerializedParameters returns the CloudFormation stack's parameters serialized to a JSON document.
 func (s *WorkerService) SerializedParameters() (string, error) {
-	return s.templateConfiguration(s)
+	return serializeTemplateConfig(s.wkld.parser, s)
 }

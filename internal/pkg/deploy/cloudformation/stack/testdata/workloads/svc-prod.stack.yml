@@ -1,7 +1,9 @@
 # Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT-0
 AWSTemplateFormatVersion: 2010-09-09
 Description: CloudFormation template that represents a load balanced web service on Amazon ECS.
+Metadata:
+  Version: v1.29.0
 Parameters:
   AppName:
     Type: String
@@ -13,17 +15,12 @@ Parameters:
     Type: String
   ContainerPort:
     Type: Number
-  RulePath:
-    Type: String
   TaskCPU:
     Type: String
   TaskMemory:
     Type: String
   TaskCount:
     Type: Number
-  HTTPSEnabled:
-    Type: String
-    AllowedValues: [true, false]
   DNSDelegated:
     Type: String
     AllowedValues: [true, false]
@@ -37,28 +34,39 @@ Parameters:
     Description: 'URL of the environment file.'
     Type: String
     Default: ""
+  ArtifactKeyARN:
+    Type: String
+    Description: 'KMS Key used for encrypting artifacts'
+  LoggingEnvFileARN:
+    Description: 'URL of the environment file for the logging sidecar.'
+    Type: String
+    Default: ""
+  EnvFileARNFornginx:
+    Description: 'URL of the environment file for the nginx sidecar.'
+    Type: String
+    Default: ""
+  EnvFileARNForoperation:
+    Description: 'URL of the environment file for the operation sidecar.'
+    Type: String
+    Default: ""
   TargetContainer:
     Type: String
   TargetPort:
     Type: Number
-  Stickiness:
+  HTTPSEnabled:
     Type: String
-    Default: false
+    AllowedValues: [true, false]
+  RulePath:
+    Type: String
 Conditions:
-  HTTPLoadBalancer:
-    !Not
-      - !Condition HTTPSLoadBalancer
-  HTTPSLoadBalancer:
-    !Equals [!Ref HTTPSEnabled, true]
-  HasAssociatedDomain:
-    !Equals [!Ref DNSDelegated, true]
-  HasAddons: # If a bucket URL is specified, that means the template exists.
-    !Not [!Equals [!Ref AddonsTemplateURL, ""]]
-  HasEnvFile:
-    !Not [!Equals [!Ref EnvFileARN, ""]]
-  IsDefaultRootPath: # If we're using path based routing and use the root path, we have some special logic
-    !Equals [!Ref RulePath, "/"]
-Resources:
+  IsGovCloud: !Equals [!Ref "AWS::Partition", "aws-us-gov"]
+  HasAssociatedDomain: !Equals [!Ref DNSDelegated, true]
+  HasAddons: !Not [!Equals [!Ref AddonsTemplateURL, ""]]
+  HasEnvFile: !Not [!Equals [!Ref EnvFileARN, ""]]
+  HasLoggingEnvFile: !Not [!Equals [!Ref LoggingEnvFileARN, ""]]
+  HasEnvFileFornginx: !Not [!Equals [!Ref EnvFileARNFornginx, ""]]
+  HasEnvFileForoperation: !Not [!Equals [!Ref EnvFileARNForoperation, ""]]
+Resources: # If a bucket URL is specified, that means the template exists.
   LogGroup:
     Metadata:
       'aws:copilot:description': 'A CloudWatch log group to hold your service logs'
@@ -93,21 +101,40 @@ Resources:
             - Name: COPILOT_SERVICE_NAME
               Value: !Sub '${WorkloadName}'
             - Name: COPILOT_SNS_TOPIC_ARNS
-              Value: '{"givesdogs":"arn:aws:sns:us-west-2:123456789123:my-app-prod-fe-givesdogs"}'
+              Value: '{"givesdogs":"arn:aws:sns:us-west-2:123456789123:my-app-prod-fe-givesdogs","mytopic.fifo":"arn:aws:sns:us-west-2:123456789123:my-app-prod-fe-mytopic.fifo"}'
             - Name: COPILOT_LB_DNS
               Value: !GetAtt EnvControllerAction.PublicLoadBalancerDNSName
+            - Name: DB_NAME
+              Value:
+                Fn::ImportValue: "MyDB"
             - Name: LOG_LEVEL
               Value: "info"
             - Name: COPILOT_MOUNT_POINTS
               Value: '{"persistence":"/etc/scratch"}'
+          Secrets:
+            - Name: DB
+              ValueFrom: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:demo/testing/mysql'
+            - Name: GIT_USERNAME
+              ValueFrom:
+                Fn::ImportValue: "stack-SSMGHUserName"
+            - Name: SQL_PASS
+              ValueFrom: SQL_PASS         
           EnvironmentFiles:
-          - !If
-            - HasEnvFile
-            - Type: s3
-              Value: !Ref EnvFileARN
-            - !Ref AWS::NoValue
+            - !If
+              - HasEnvFile
+              - Type: s3
+                Value: !Ref EnvFileARN
+              - !Ref AWS::NoValue
           LogConfiguration:
             LogDriver: awsfirelens
+            SecretOptions:
+            - Name: DB
+              ValueFrom: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:demo/testing/mysql'
+            - Name: GIT_USERNAME
+              ValueFrom:
+                Fn::ImportValue: "stack-SSMGHUserName"
+            - Name: SQL_USERNAME
+              ValueFrom: SQL_USERNAME
             Options:
               Name: "cloudwatch"
               log_group_name: "/copilot/sidecar-test-hello"
@@ -118,9 +145,10 @@ Resources:
               ReadOnly: true
               SourceVolume: persistence
           PortMappings:
-            - ContainerPort: !Ref ContainerPort
+            - ContainerPort: 4000
+              Protocol: tcp
         - Name: firelens_log_router
-          Image: public.ecr.aws/aws-observability/aws-for-fluent-bit:latest
+          Image: public.ecr.aws/aws-observability/aws-for-fluent-bit:stable
           Environment:
             - Name: COPILOT_APPLICATION_NAME
               Value: !Sub '${AppName}'
@@ -131,14 +159,26 @@ Resources:
             - Name: COPILOT_SERVICE_NAME
               Value: !Sub '${WorkloadName}'
             - Name: COPILOT_SNS_TOPIC_ARNS
-              Value: '{"givesdogs":"arn:aws:sns:us-west-2:123456789123:my-app-prod-fe-givesdogs"}'
+              Value: '{"givesdogs":"arn:aws:sns:us-west-2:123456789123:my-app-prod-fe-givesdogs","mytopic.fifo":"arn:aws:sns:us-west-2:123456789123:my-app-prod-fe-mytopic.fifo"}'
             - Name: COPILOT_LB_DNS
               Value: !GetAtt EnvControllerAction.PublicLoadBalancerDNSName
+            - Name: DB_NAME
+              Value:
+                Fn::ImportValue: "MyDB"
             - Name: TEST
               Value: "TEST"
+          EnvironmentFiles:
+            - !If
+              - HasLoggingEnvFile
+              - Type: "s3"
+                Value: !Ref LoggingEnvFileARN
+              - !Ref "AWS::NoValue"
           Secrets:
             - Name: GITHUB_TOKEN
               ValueFrom: GITHUB_TOKEN
+            - Name: MONGO_DB
+              ValueFrom:
+                Fn::ImportValue: "stack-MongoUserName"
           FirelensConfiguration:
             Type: fluentbit
             Options:
@@ -152,13 +192,25 @@ Resources:
         - Name: nginx
           Image: 1234567890.dkr.ecr.us-west-2.amazonaws.com/reverse-proxy:revision_1
           PortMappings:
-            - ContainerPort: 80
+            - ContainerPort: 8080
+              Protocol: tcp
+              Name: target
+            - ContainerPort: 8081
+              Protocol: tcp
           HealthCheck:
             Command: ["CMD-SHELL", "curl -f http://localhost:8080 || exit 1"]
             Interval: 10
             Retries: 2
             StartPeriod: 0
             Timeout: 5
+          Secrets:
+            - Name: DB
+              ValueFrom: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:demo/testing/mysql'
+            - Name: GIT_USERNAME
+              ValueFrom:
+                Fn::ImportValue: "stack-SSMGHUserName"
+            - Name: SQL_PASS
+              ValueFrom: SQL_PASS
           Environment:
             - Name: COPILOT_APPLICATION_NAME
               Value: !Sub '${AppName}'
@@ -169,11 +221,50 @@ Resources:
             - Name: COPILOT_SERVICE_NAME
               Value: !Sub '${WorkloadName}'
             - Name: COPILOT_SNS_TOPIC_ARNS
-              Value: '{"givesdogs":"arn:aws:sns:us-west-2:123456789123:my-app-prod-fe-givesdogs"}'
+              Value: '{"givesdogs":"arn:aws:sns:us-west-2:123456789123:my-app-prod-fe-givesdogs","mytopic.fifo":"arn:aws:sns:us-west-2:123456789123:my-app-prod-fe-mytopic.fifo"}'
             - Name: COPILOT_LB_DNS
               Value: !GetAtt EnvControllerAction.PublicLoadBalancerDNSName
+            - Name: DB_NAME
+              Value:
+                Fn::ImportValue: "MyDB"
             - Name: NGINX_PORT
               Value: "80"
+          EnvironmentFiles:
+            - !If
+              - HasEnvFileFornginx
+              - Type: "s3"
+                Value: !Ref EnvFileARNFornginx
+              - !Ref "AWS::NoValue"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: copilot
+        - Name: operation
+          Image: alpine:latest
+          Command:
+            - echo
+            - $COPILOT_APPLICATION_NAME
+          Environment:
+            - Name: COPILOT_APPLICATION_NAME
+              Value: !Sub '${AppName}'
+            - Name: COPILOT_SERVICE_DISCOVERY_ENDPOINT
+              Value: prod.my-app.local
+            - Name: COPILOT_ENVIRONMENT_NAME
+              Value: !Sub '${EnvName}'
+            - Name: COPILOT_SERVICE_NAME
+              Value: !Sub '${WorkloadName}'
+            - Name: COPILOT_SNS_TOPIC_ARNS
+              Value: '{"givesdogs":"arn:aws:sns:us-west-2:123456789123:my-app-prod-fe-givesdogs","mytopic.fifo":"arn:aws:sns:us-west-2:123456789123:my-app-prod-fe-mytopic.fifo"}'
+            - Name: COPILOT_LB_DNS
+              Value: !GetAtt EnvControllerAction.PublicLoadBalancerDNSName
+          EnvironmentFiles:
+            - !If
+              - HasEnvFileForoperation
+              - Type: "s3"
+                Value: !Ref EnvFileARNForoperation
+              - !Ref "AWS::NoValue"
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -188,6 +279,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -220,7 +312,17 @@ Resources:
                 Action:
                   - 'kms:Decrypt'
                 Resource:
+                  - !Ref ArtifactKeyARN
+              - Sid: DecryptTaggedKMSKey
+                Effect: 'Allow'
+                Action:
+                  - 'kms:Decrypt'
+                Resource:
                   - !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/copilot-application': !Sub '${AppName}'
+                    'aws:ResourceTag/copilot-environment': !Sub '${EnvName}'
         - !If
           - HasEnvFile
           - PolicyName: !Join ['', [!Ref AppName, '-', !Ref EnvName, '-', !Ref WorkloadName, GetEnvFilePolicy]]
@@ -243,6 +345,72 @@ Resources:
                         - ':s3:::'
                         - !Select [0, !Split ['/', !Select [5, !Split [':', !Ref EnvFileARN]]]]
           - !Ref AWS::NoValue
+        - !If
+          - HasLoggingEnvFile
+          - PolicyName: !Join ['', [!Ref AppName, '-', !Ref EnvName, '-', !Ref WorkloadName, GetLoggingEnvFilePolicy]]
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: 'Allow'
+                  Action:
+                    - 's3:GetObject'
+                  Resource:
+                    - !Ref LoggingEnvFileARN
+                - Effect: 'Allow'
+                  Action:
+                    - 's3:GetBucketLocation'
+                  Resource:
+                    - !Join
+                      - ''
+                      - - 'arn:'
+                        - !Ref AWS::Partition
+                        - ':s3:::'
+                        - !Select [0, !Split ['/', !Select [5, !Split [':', !Ref LoggingEnvFileARN]]]]
+          - !Ref AWS::NoValue
+        - !If
+          - HasEnvFileFornginx
+          - PolicyName: !Join ['', [!Ref AppName, '-', !Ref EnvName, '-', !Ref WorkloadName, GetEnvFilePolicyFornginx]]
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: 'Allow'
+                  Action:
+                    - 's3:GetObject'
+                  Resource:
+                    - !Ref EnvFileARNFornginx
+                - Effect: 'Allow'
+                  Action:
+                    - 's3:GetBucketLocation'
+                  Resource:
+                    - !Join
+                      - ''
+                      - - 'arn:'
+                        - !Ref AWS::Partition
+                        - ':s3:::'
+                        - !Select [0, !Split ['/', !Select [5, !Split [':', !Ref EnvFileARNFornginx]]]]
+          - !Ref AWS::NoValue
+        - !If
+          - HasEnvFileForoperation
+          - PolicyName: !Join ['', [!Ref AppName, '-', !Ref EnvName, '-', !Ref WorkloadName, GetEnvFilePolicyForoperation]]
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: 'Allow'
+                  Action:
+                    - 's3:GetObject'
+                  Resource:
+                    - !Ref EnvFileARNForoperation
+                - Effect: 'Allow'
+                  Action:
+                    - 's3:GetBucketLocation'
+                  Resource:
+                    - !Join
+                      - ''
+                      - - 'arn:'
+                        - !Ref AWS::Partition
+                        - ':s3:::'
+                        - !Select [0, !Split ['/', !Select [5, !Split [':', !Ref EnvFileARNForoperation]]]]
+          - !Ref AWS::NoValue
       ManagedPolicyArns:
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
   TaskRole:
@@ -251,27 +419,20 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
               Service: ecs-tasks.amazonaws.com
             Action: 'sts:AssumeRole'
       Policies:
-        - PolicyName: 'DenyIAMExceptTaggedRoles'
+        - PolicyName: 'DenyIAM'
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: 'Deny'
                 Action: 'iam:*'
                 Resource: '*'
-              - Effect: 'Allow'
-                Action: 'sts:AssumeRole'
-                Resource:
-                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
-                Condition:
-                  StringEquals:
-                    'iam:ResourceTag/copilot-application': !Sub '${AppName}'
-                    'iam:ResourceTag/copilot-environment': !Sub '${EnvName}'
         - PolicyName: 'Publish2SNS'
           PolicyDocument:
             Version: '2012-10-17'
@@ -280,6 +441,7 @@ Resources:
                 Action: 'sns:Publish'
                 Resource:
                   - !Ref givesdogsSNSTopic
+                  - !Ref mytopicfifoSNSTopic
   DiscoveryService:
     Metadata:
       'aws:copilot:description': 'Service discovery for your services to communicate within the VPC'
@@ -299,6 +461,8 @@ Resources:
       NamespaceId:
         Fn::ImportValue: !Sub '${AppName}-${EnvName}-ServiceDiscoveryNamespaceID'
   DynamicDesiredCountAction:
+    Metadata:
+      'aws:copilot:description': "A custom resource returning the ECS service's running task count"
     Type: Custom::DynamicDesiredCountFunction
     Properties:
       ServiceToken: !GetAtt DynamicDesiredCountFunction.Arn
@@ -313,18 +477,62 @@ Resources:
   DynamicDesiredCountFunction:
     Type: AWS::Lambda::Function
     Properties:
-      Code:
-        ZipFile: |
-          mockDynamicDesiredCountZipFile
       Handler: "index.handler"
       Timeout: 600
       MemorySize: 512
-      Role: !GetAtt 'CustomResourceRole.Arn'
-      Runtime: nodejs12.x
-  AutoScalingRole:
+      Role: !GetAtt 'DynamicDesiredCountFunctionRole.Arn'
+      Runtime: nodejs20.x
+  DynamicDesiredCountFunctionRole:
+    Metadata:
+      'aws:copilot:description': "An IAM Role for describing number of running tasks in your ECS service"
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: "DelegateDesiredCountAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ECS
+                Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    'ecs:cluster':
+                      Fn::Sub:
+                        - arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}
+                        - ClusterName:
+                            Fn::ImportValue: !Sub '${AppName}-${EnvName}-ClusterId'
+              - Sid: ResourceGroups
+                Effect: Allow
+                Action:
+                  - resource-groups:GetResources
+                Resource: "*"
+              - Sid: Tags
+                Effect: Allow
+                Action:
+                  - "tag:GetResources"
+                Resource: "*"
+  AutoScalingRole:
+    Metadata:
+      'aws:copilot:description': 'An IAM role for container auto scaling'
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -357,8 +565,8 @@ Resources:
       TargetTrackingScalingPolicyConfiguration:
         PredefinedMetricSpecification:
           PredefinedMetricType: ECSServiceAverageCPUUtilization
-        ScaleInCooldown: 120
-        ScaleOutCooldown: 60
+        ScaleInCooldown: 30
+        ScaleOutCooldown: 150
         TargetValue: 70
   EnvControllerAction:
     Metadata:
@@ -367,25 +575,25 @@ Resources:
     Properties:
       ServiceToken: !GetAtt EnvControllerFunction.Arn
       Workload: !Ref WorkloadName
-      Aliases: [example.com]
+      Aliases: ["example.com"]
       EnvStack: !Sub '${AppName}-${EnvName}'
       Parameters: [ALBWorkloads, Aliases]
+      EnvVersion: v1.42.0
   EnvControllerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      Code:
-        ZipFile: |
-          mockEnvControllerZipFile
       Handler: "index.handler"
       Timeout: 900
       MemorySize: 512
       Role: !GetAtt 'EnvControllerRole.Arn'
-      Runtime: nodejs12.x
+      Runtime: nodejs20.x
   EnvControllerRole:
+    Metadata:
+      'aws:copilot:description': "An IAM role to update your environment stack"
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -427,7 +635,12 @@ Resources:
       'aws:copilot:description': 'An ECS service to run and maintain your tasks in the environment cluster'
     Type: AWS::ECS::Service
     DependsOn:
-      - WaitUntilListenerRuleIsCreated
+      - HTTPListenerRuleWithDomain
+      - HTTPSListenerRule
+      - HTTPListenerRuleWithDomain1
+      - HTTPSListenerRule1
+      - HTTPListenerRuleWithDomain2
+      - HTTPSListenerRule2
     Properties:
       PlatformVersion: LATEST
       Cluster:
@@ -440,6 +653,11 @@ Resources:
           Rollback: true
         MinimumHealthyPercent: 100
         MaximumPercent: 200
+        Alarms:
+          Enable: true
+          Rollback: true
+          AlarmNames:
+            - my-app-prod-fe-CopilotRollbackCPUAlarm
       PropagateTags: SERVICE
       CapacityProviderStrategy:
         - CapacityProvider: FARGATE_SPOT
@@ -447,6 +665,22 @@ Resources:
         - CapacityProvider: FARGATE
           Weight: 0
           Base: 5
+      ServiceConnectConfiguration:
+        Enabled: True
+        Namespace: prod.my-app.local
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-region: !Ref AWS::Region
+            awslogs-group: !Ref LogGroup
+            awslogs-stream-prefix: copilot
+        Services:
+          - PortName: target
+            # Avoid using the same service with Service Discovery in a namespace.
+            DiscoveryName: !Join ["-", [!Ref WorkloadName, "sc"]]
+            ClientAliases:
+              - Port: !Ref TargetPort
+                DnsName: api
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
@@ -459,44 +693,81 @@ Resources:
       # This may need to be adjusted if the container takes a while to start up
       HealthCheckGracePeriodSeconds: 60
       LoadBalancers:
-        - ContainerName: !Ref TargetContainer
-          ContainerPort: !Ref TargetPort
+        - ContainerName: nginx
+          ContainerPort: 8080
           TargetGroupArn: !Ref TargetGroup
+        - ContainerName: nginx
+          ContainerPort: 8081
+          TargetGroupArn: !Ref TargetGroup1
+        - ContainerName: fe
+          ContainerPort: 4000
+          TargetGroupArn: !Ref TargetGroup2
       ServiceRegistries:
         - RegistryArn: !GetAtt DiscoveryService.Arn
-          Port: !Ref ContainerPort
+          Port: !Ref TargetPort
   TargetGroup:
     Metadata:
-      'aws:copilot:description': 'A target group to connect the load balancer to your service'
+      'aws:copilot:description': 'A target group to connect the load balancer to your service on port 8080'
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
       HealthCheckPath: / # Default is '/'.
-      Port: !Ref ContainerPort
+      Port: 8080
       Protocol: HTTP
       TargetGroupAttributes:
         - Key: deregistration_delay.timeout_seconds
           Value: 60 # ECS Default is 300; Copilot default is 60.
         - Key: stickiness.enabled
-          Value: !Ref Stickiness
+          Value: false
+      TargetType: ip
+      VpcId:
+        Fn::ImportValue: !Sub "${AppName}-${EnvName}-VpcId"
+  TargetGroup1:
+    Metadata:
+      'aws:copilot:description': 'A target group to connect the load balancer to your service on port 8081'
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: / # Default is '/'.
+      Port: 8081
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60 # ECS Default is 300; Copilot default is 60.
+        - Key: stickiness.enabled
+          Value: false
+      TargetType: ip
+      VpcId:
+        Fn::ImportValue: !Sub "${AppName}-${EnvName}-VpcId"
+  TargetGroup2:
+    Metadata:
+      'aws:copilot:description': 'A target group to connect the load balancer to your service on port 4000'
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: / # Default is '/'.
+      Port: 4000
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60 # ECS Default is 300; Copilot default is 60.
+        - Key: stickiness.enabled
+          Value: false
       TargetType: ip
       VpcId:
         Fn::ImportValue: !Sub "${AppName}-${EnvName}-VpcId"
   RulePriorityFunction:
     Type: AWS::Lambda::Function
     Properties:
-      Code:
-        ZipFile: |
-          mockRulePriorityZipFile
       Handler: "index.nextAvailableRulePriorityHandler"
       Timeout: 600
       MemorySize: 512
-      Role: !GetAtt 'CustomResourceRole.Arn'
-      Runtime: nodejs12.x
-  CustomResourceRole:
+      Role: !GetAtt 'RulePriorityFunctionRole.Arn'
+      Runtime: nodejs20.x
+  RulePriorityFunctionRole:
     Type: AWS::IAM::Role
+    Metadata:
+      'aws:copilot:description': "An IAM Role to describe load balancer rules for assigning a priority"
     Properties:
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -505,8 +776,10 @@ Resources:
             Action:
               - sts:AssumeRole
       Path: /
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: "DNSandACMAccess"
+        - PolicyName: "RulePriorityGeneratorAccess"
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -514,43 +787,28 @@ Resources:
                 Action:
                   - elasticloadbalancing:DescribeRules
                 Resource: "*"
-        - PolicyName: "DelegateDesiredCountAccess"
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: ECS
-                Effect: Allow
-                Action:
-                  - ecs:DescribeServices
-                Resource: "*"
-                Condition:
-                  ArnEquals:
-                    'ecs:cluster':
-                      Fn::Sub:
-                        - arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}
-                        - ClusterName:
-                            Fn::ImportValue: !Sub '${AppName}-${EnvName}-ClusterId'
-              - Sid: ResourceGroups
-                Effect: Allow
-                Action:
-                  - resource-groups:GetResources
-                Resource: "*"
-              - Sid: Tags
-                Effect: Allow
-                Action:
-                  - "tag:GetResources"
-                Resource: "*"
-      ManagedPolicyArns:
-        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
   HTTPSRulePriorityAction:
-    Condition: HTTPSLoadBalancer
+    Metadata:
+      'aws:copilot:description': 'A custom resource assigning priority for HTTPS listener rules'
     Type: Custom::RulePriorityFunction
     Properties:
       ServiceToken: !GetAtt RulePriorityFunction.Arn
+      RulePath: ["/", "/admin","/superadmin"]
       ListenerArn: !GetAtt EnvControllerAction.HTTPSListenerArn
+  
+  HTTPRuleWithDomainPriorityAction:
+    Metadata:
+      'aws:copilot:description': 'A custom resource assigning priority for HTTP listener rules'
+    Type: Custom::RulePriorityFunction
+    Properties:
+      ServiceToken: !GetAtt RulePriorityFunction.Arn
+      RulePath: ["/", "/admin", "/superadmin"]
+      ListenerArn: !GetAtt EnvControllerAction.HTTPListenerArn
+  
   HTTPListenerRuleWithDomain:
+    Metadata:
+      'aws:copilot:description': 'An HTTP listener rule for path `/` that redirects HTTP to HTTPS'
     Type: AWS::ElasticLoadBalancingV2::ListenerRule
-    Condition: HTTPSLoadBalancer
     Properties:
       Actions:
         - Type: redirect
@@ -564,19 +822,67 @@ Resources:
       Conditions:
         - Field: 'host-header'
           HostHeaderConfig:
-            Values: [example.com]
+            Values: ["example.com"]
         - Field: 'path-pattern'
           PathPatternConfig:
-            Values: !If
-              - IsDefaultRootPath
-              - - "/*"
-              - - !Sub "/${RulePath}"
-                - !Sub "/${RulePath}/*"
+            Values:
+              - "/*"
       ListenerArn: !GetAtt EnvControllerAction.HTTPListenerArn
-      Priority: !GetAtt HTTPSRulePriorityAction.Priority # Same priority as HTTPS Listener
-  HTTPSListenerRule:
+      Priority: !GetAtt HTTPRuleWithDomainPriorityAction.Priority
+  HTTPListenerRuleWithDomain1:
+    Metadata:
+      'aws:copilot:description': 'An HTTP listener rule for path `/admin` that redirects HTTP to HTTPS'
     Type: AWS::ElasticLoadBalancingV2::ListenerRule
-    Condition: HTTPSLoadBalancer
+    Properties:
+      Actions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: 443
+            Host: "#{host}"
+            Path: "/#{path}"
+            Query: "#{query}"
+            StatusCode: HTTP_301
+      Conditions:
+        - Field: 'host-header'
+          HostHeaderConfig:
+            Values: [ "example.com" ]
+        - Field: 'path-pattern'
+          PathPatternConfig:
+            Values:
+              - "/admin"
+              - "/admin/*"
+      ListenerArn: !GetAtt EnvControllerAction.HTTPListenerArn
+      Priority: !GetAtt HTTPRuleWithDomainPriorityAction.Priority1
+  HTTPListenerRuleWithDomain2:
+    Metadata:
+      'aws:copilot:description': 'An HTTP listener rule for path `/superadmin` that redirects HTTP to HTTPS'
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: 443
+            Host: "#{host}"
+            Path: "/#{path}"
+            Query: "#{query}"
+            StatusCode: HTTP_301
+      Conditions:
+        - Field: 'host-header'
+          HostHeaderConfig:
+            Values: [ "example.com" ]
+        - Field: 'path-pattern'
+          PathPatternConfig:
+            Values:
+              - "/superadmin"
+              - "/superadmin/*"
+      ListenerArn: !GetAtt EnvControllerAction.HTTPListenerArn
+      Priority: !GetAtt HTTPRuleWithDomainPriorityAction.Priority2
+  HTTPSListenerRule:
+    Metadata:
+      'aws:copilot:description': 'An HTTPS listener rule for path `/` that forwards HTTPS traffic to your tasks'
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
     Properties:
       Actions:
         - TargetGroupArn: !Ref TargetGroup
@@ -584,68 +890,51 @@ Resources:
       Conditions:
         - Field: 'host-header'
           HostHeaderConfig:
-            Values: [example.com]
+            Values: ["example.com"]
         - Field: 'path-pattern'
           PathPatternConfig:
-            Values: !If
-              - IsDefaultRootPath
-              - - "/*"
-              - - !Sub "/${RulePath}"
-                - !Sub "/${RulePath}/*"
+            Values:
+              - "/*"
       ListenerArn: !GetAtt EnvControllerAction.HTTPSListenerArn
       Priority: !GetAtt HTTPSRulePriorityAction.Priority
-  HTTPRulePriorityAction:
-    Condition: HTTPLoadBalancer
-    Type: Custom::RulePriorityFunction
-    Properties:
-      ServiceToken: !GetAtt RulePriorityFunction.Arn
-      ListenerArn: !GetAtt EnvControllerAction.HTTPListenerArn
-  HTTPListenerRule:
+  HTTPSListenerRule1:
+    Metadata:
+      'aws:copilot:description': 'An HTTPS listener rule for path `/admin` that forwards HTTPS traffic to your tasks'
     Type: AWS::ElasticLoadBalancingV2::ListenerRule
-    Condition: HTTPLoadBalancer
     Properties:
       Actions:
-        - TargetGroupArn: !Ref TargetGroup
+        - TargetGroupArn: !Ref TargetGroup1
           Type: forward
       Conditions:
+        - Field: 'host-header'
+          HostHeaderConfig:
+            Values: [ "example.com" ]
         - Field: 'path-pattern'
           PathPatternConfig:
-            Values: !If
-              - IsDefaultRootPath
-              - - "/*"
-              - - !Sub "/${RulePath}"
-                - !Sub "/${RulePath}/*"
-      ListenerArn: !GetAtt EnvControllerAction.HTTPListenerArn
-      Priority: !If
-        - IsDefaultRootPath
-        - 50000 # This is the max rule priority. Since this rule evaluates true for everything, we make sure it is last
-        - !GetAtt HTTPRulePriorityAction.Priority
-  # Force a conditional dependency from the ECS service on the listener rules.
-  # Our service depends on our HTTP/S listener to be set up before it can
-  # be created. But, since our environment is either HTTPS or not, we
-  # have a conditional dependency (we have to wait for the HTTPS listener
-  # to be created or the HTTP listener to be created). In order to have a
-  # conditional dependency, we use the WaitHandle resource as a way to force
-  # a single dependency. The Ref in the WaitCondition implicitly creates a conditional
-  # dependency - if the condition is satisfied (HTTPLoadBalancer) - the ref resolves
-  # the HTTPWaitHandle, which depends on the HTTPListenerRule.
-  HTTPSWaitHandle:
-    Condition: HTTPSLoadBalancer
-    DependsOn: HTTPSListenerRule
-    Type: AWS::CloudFormation::WaitConditionHandle
-  HTTPWaitHandle:
-    Condition: HTTPLoadBalancer
-    DependsOn: HTTPListenerRule
-    Type: AWS::CloudFormation::WaitConditionHandle
-  # We don't actually need to wait for the condition to
-  # be completed, that's why we set a count of 0. The timeout
-  # is a required field, but useless, so we set it to one.
-  WaitUntilListenerRuleIsCreated:
-    Type: AWS::CloudFormation::WaitCondition
+            Values:
+              - "/admin"
+              - "/admin/*"
+      ListenerArn: !GetAtt EnvControllerAction.HTTPSListenerArn
+      Priority: !GetAtt HTTPSRulePriorityAction.Priority1
+  HTTPSListenerRule2:
+    Metadata:
+      'aws:copilot:description': 'An HTTPS listener rule for path `/superadmin` that forwards HTTPS traffic to your tasks'
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
     Properties:
-      Handle: !If [HTTPLoadBalancer, !Ref HTTPWaitHandle, !Ref HTTPSWaitHandle]
-      Timeout: "1"
-      Count: 0
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup2
+          Type: forward
+      Conditions:
+        - Field: 'host-header'
+          HostHeaderConfig:
+            Values: [ "example.com" ]
+        - Field: 'path-pattern'
+          PathPatternConfig:
+            Values:
+              - "/superadmin"
+              - "/superadmin/*"
+      ListenerArn: !GetAtt EnvControllerAction.HTTPSListenerArn
+      Priority: !GetAtt HTTPSRulePriorityAction.Priority2
   AddonsStack:
     Metadata:
       'aws:copilot:description': 'An Addons CloudFormation Stack for your additional AWS resources'
@@ -658,6 +947,28 @@ Resources:
         Env: !Ref EnvName
         Name: !Ref WorkloadName
       TemplateURL: !Ref AddonsTemplateURL
+  CPURollbackAlarm:
+    Metadata:
+      'aws:copilot:description': "A CloudWatch alarm associated with CPU utilization for deployment rollbacks"
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Roll back ECS service if CPU utilization is greater than or equal to 70% twice in 3 minutes."
+      AlarmName: my-app-prod-fe-CopilotRollbackCPUAlarm
+      Namespace: 'AWS/ECS'
+      Dimensions:
+        - Name: ClusterName
+          Value:
+            Fn::ImportValue: !Sub '${AppName}-${EnvName}-ClusterId'
+        - Name: ServiceName
+          Value: !Select [ 2, !Split [ "/", !Ref Service ] ]
+      MetricName: 'CPUUtilization'
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      DatapointsToAlarm: 2
+      EvaluationPeriods: 3
+      Period: 60
+      Statistic: 'Average'
+      Threshold: 70
+      Unit: 'Percent'
   givesdogsSNSTopic:
     Metadata:
       'aws:copilot:description': 'A SNS topic to broadcast givesdogs events'
@@ -680,6 +991,32 @@ Resources:
             Action:
               - sns:Subscribe
             Resource: !Ref givesdogsSNSTopic
+            Condition:
+              StringEquals:
+                "sns:Protocol": "sqs"
+  mytopicfifoSNSTopic:
+    Metadata:
+      'aws:copilot:description': 'A SNS FIFO topic to broadcast mytopic.fifo events'
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-mytopic.fifo'
+      FifoTopic: true
+      KmsMasterKeyId: 'alias/aws/sns'
+  mytopicfifoSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    DependsOn: mytopicfifoSNSTopic
+    Properties:
+      Topics:
+        - !Ref mytopicfifoSNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - sns:Subscribe
+            Resource: !Ref mytopicfifoSNSTopic
             Condition:
               StringEquals:
                 "sns:Protocol": "sqs"

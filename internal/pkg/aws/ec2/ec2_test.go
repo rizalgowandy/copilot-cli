@@ -11,7 +11,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/copilot-cli/internal/pkg/aws/ec2/mocks"
-	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 )
@@ -19,11 +18,11 @@ import (
 var (
 	inAppEnvFilters = []Filter{
 		{
-			Name:   fmt.Sprintf(TagFilterName, deploy.AppTagKey),
+			Name:   fmt.Sprintf(FmtTagFilter, "copilot-application"),
 			Values: []string{"my-app"},
 		},
 		{
-			Name:   fmt.Sprintf(TagFilterName, deploy.EnvTagKey),
+			Name:   fmt.Sprintf(FmtTagFilter, "copilot-environment"),
 			Values: []string{"my-env"},
 		},
 	}
@@ -41,6 +40,33 @@ var (
 		MapPublicIpOnLaunch: aws.Bool(true),
 	}
 )
+
+func TestEC2_FilterForTags(t *testing.T) {
+	testCases := map[string]struct {
+		inValues []string
+		wanted   Filter
+	}{
+		"with no values": {
+			wanted: Filter{
+				Name:   "tag-key",
+				Values: []string{"mockKey"},
+			},
+		},
+		"with values": {
+			inValues: []string{"foo", "bar"},
+			wanted: Filter{
+				Name:   "tag:mockKey",
+				Values: []string{"foo", "bar"},
+			},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			filter := FilterForTags("mockKey", tc.inValues...)
+			require.Equal(t, tc.wanted, filter)
+		})
+	}
+}
 
 func TestEC2_extractResource(t *testing.T) {
 	testCases := map[string]struct {
@@ -240,6 +266,183 @@ func TestEC2_ListAZs(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				require.ElementsMatch(t, tc.wantedAZs, azs)
+			}
+		})
+	}
+}
+
+func TestEC2_managedPrefixList(t *testing.T) {
+	const (
+		mockPrefixListName = "mockName"
+		mockPrefixListId   = "mockId"
+		mockNextToken      = "mockNextToken"
+	)
+	mockError := errors.New("some error")
+	mockFilter := []*ec2.Filter{
+		{
+			Name:   aws.String("prefix-list-name"),
+			Values: aws.StringSlice([]string{mockPrefixListName}),
+		},
+	}
+	mockPrefixList := []*ec2.ManagedPrefixList{
+		{
+			PrefixListId: aws.String(mockPrefixListId),
+		},
+	}
+
+	testCases := map[string]struct {
+		mockEC2Client func(m *mocks.Mockapi)
+
+		wantedError          error
+		wantedErrorMsgPrefix string
+		wantedList           *ec2.DescribeManagedPrefixListsOutput
+	}{
+		"query returns error": {
+			mockEC2Client: func(m *mocks.Mockapi) {
+				m.EXPECT().DescribeManagedPrefixLists(gomock.Any()).Return(nil, mockError)
+			},
+			wantedError: fmt.Errorf("describe managed prefix list with name %s: %w", mockPrefixListName, mockError),
+		},
+		"query returns Successfully": {
+			mockEC2Client: func(m *mocks.Mockapi) {
+				m.EXPECT().DescribeManagedPrefixLists(&ec2.DescribeManagedPrefixListsInput{
+					Filters: mockFilter,
+				}).Return(&ec2.DescribeManagedPrefixListsOutput{
+					NextToken: aws.String(mockNextToken),
+					PrefixLists: []*ec2.ManagedPrefixList{
+						{
+							PrefixListId: aws.String(mockPrefixListId),
+						},
+					},
+				}, nil)
+			},
+			wantedList: &ec2.DescribeManagedPrefixListsOutput{
+				NextToken:   aws.String(mockNextToken),
+				PrefixLists: mockPrefixList,
+			},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+
+			mockAPI := mocks.NewMockapi(ctrl)
+			tc.mockEC2Client(mockAPI)
+
+			ec2Client := EC2{
+				client: mockAPI,
+			}
+
+			output, err := ec2Client.managedPrefixList(mockPrefixListName)
+			if tc.wantedError != nil {
+				require.EqualError(t, tc.wantedError, err.Error())
+			} else if tc.wantedErrorMsgPrefix != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.wantedErrorMsgPrefix)
+				return
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.wantedList, output, "managed prefix lists output must be equal")
+			}
+		})
+	}
+}
+
+func TestEC2_CloudFrontManagedPrefixListId(t *testing.T) {
+	const (
+		mockPrefixListName = cloudFrontPrefixListName
+		mockPrefixListId   = "mockId"
+		mockNextToken      = "mockNextToken"
+	)
+	mockError := errors.New("some error")
+	mockFilter := []*ec2.Filter{
+		{
+			Name:   aws.String("prefix-list-name"),
+			Values: aws.StringSlice([]string{mockPrefixListName}),
+		},
+	}
+
+	testCases := map[string]struct {
+		mockEC2Client func(m *mocks.Mockapi)
+
+		wantedError          error
+		wantedErrorMsgPrefix string
+		wantedId             string
+	}{
+		"query returns error": {
+			mockEC2Client: func(m *mocks.Mockapi) {
+				m.EXPECT().DescribeManagedPrefixLists(gomock.Any()).Return(nil, mockError)
+			},
+			wantedError: fmt.Errorf("describe managed prefix list with name %s: %w", mockPrefixListName, mockError),
+		},
+		"query returns no prefix list ids": {
+			mockEC2Client: func(m *mocks.Mockapi) {
+				m.EXPECT().DescribeManagedPrefixLists(&ec2.DescribeManagedPrefixListsInput{
+					Filters: mockFilter,
+				}).Return(&ec2.DescribeManagedPrefixListsOutput{
+					NextToken:   aws.String(mockNextToken),
+					PrefixLists: []*ec2.ManagedPrefixList{},
+				}, nil)
+			},
+			wantedError: fmt.Errorf("cannot find any prefix list with name: %s", mockPrefixListName),
+		},
+		"query returns too many prefix list ids": {
+			mockEC2Client: func(m *mocks.Mockapi) {
+				m.EXPECT().DescribeManagedPrefixLists(&ec2.DescribeManagedPrefixListsInput{
+					Filters: mockFilter,
+				}).Return(&ec2.DescribeManagedPrefixListsOutput{
+					NextToken: aws.String(mockNextToken),
+					PrefixLists: []*ec2.ManagedPrefixList{
+						{
+							PrefixListId: aws.String(mockPrefixListId),
+						},
+						{
+							PrefixListId: aws.String(mockPrefixListId),
+						},
+					},
+				}, nil)
+			},
+			wantedErrorMsgPrefix: `found more than one prefix list with the name `,
+		},
+		"query returns Successfully": {
+			mockEC2Client: func(m *mocks.Mockapi) {
+				m.EXPECT().DescribeManagedPrefixLists(&ec2.DescribeManagedPrefixListsInput{
+					Filters: mockFilter,
+				}).Return(&ec2.DescribeManagedPrefixListsOutput{
+					NextToken: aws.String(mockNextToken),
+					PrefixLists: []*ec2.ManagedPrefixList{
+						{
+							PrefixListId: aws.String(mockPrefixListId),
+						},
+					},
+				}, nil)
+			},
+			wantedId: mockPrefixListId,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+
+			mockAPI := mocks.NewMockapi(ctrl)
+			tc.mockEC2Client(mockAPI)
+
+			ec2Client := EC2{
+				client: mockAPI,
+			}
+
+			id, err := ec2Client.CloudFrontManagedPrefixListID()
+			if tc.wantedError != nil {
+				require.EqualError(t, tc.wantedError, err.Error())
+			} else if tc.wantedErrorMsgPrefix != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.wantedErrorMsgPrefix)
+				return
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.wantedId, id, "ids must be equal")
 			}
 		})
 	}
@@ -624,6 +827,17 @@ func TestEC2_SubnetIDs(t *testing.T) {
 				}).Return(nil, errors.New("error describing subnets"))
 			},
 			wantedError: fmt.Errorf("describe subnets: error describing subnets"),
+		},
+		"cannot get any subnets": {
+			inFilter: inAppEnvFilters,
+			mockEC2Client: func(m *mocks.Mockapi) {
+				m.EXPECT().DescribeSubnets(&ec2.DescribeSubnetsInput{
+					Filters: toEC2Filter(inAppEnvFilters),
+				}).Return(&ec2.DescribeSubnetsOutput{
+					Subnets: []*ec2.Subnet{},
+				}, nil)
+			},
+			wantedError: fmt.Errorf("cannot find any subnets"),
 		},
 		"successfully get subnets": {
 			inFilter: inAppEnvFilters,

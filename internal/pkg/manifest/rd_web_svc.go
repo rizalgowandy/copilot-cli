@@ -5,6 +5,7 @@ package manifest
 
 import (
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/imdario/mergo"
 )
@@ -22,17 +23,23 @@ type RequestDrivenWebService struct {
 	parser template.Parser
 }
 
+func (s *RequestDrivenWebService) subnets() *SubnetListOrArgs {
+	return &s.Network.VPC.Placement.Subnets
+}
+
 // RequestDrivenWebServiceConfig holds the configuration that can be overridden per environments.
 type RequestDrivenWebServiceConfig struct {
 	RequestDrivenWebServiceHttpConfig `yaml:"http,flow"`
 	InstanceConfig                    AppRunnerInstanceConfig              `yaml:",inline"`
 	ImageConfig                       ImageWithPort                        `yaml:"image"`
-	Variables                         map[string]string                    `yaml:"variables"`
+	Variables                         map[string]Variable                  `yaml:"variables"`
+	Secrets                           map[string]Secret                    `yaml:"secrets"`
 	StartCommand                      *string                              `yaml:"command"`
 	Tags                              map[string]string                    `yaml:"tags"`
 	PublishConfig                     PublishConfig                        `yaml:"publish"`
 	Network                           RequestDrivenWebServiceNetworkConfig `yaml:"network"`
 	Observability                     Observability                        `yaml:"observability"`
+	Count                             *string                              `yaml:"count"`
 }
 
 // Observability holds configuration for observability to the service.
@@ -60,21 +67,31 @@ func (c *RequestDrivenWebServiceNetworkConfig) IsEmpty() bool {
 	return c.VPC.isEmpty()
 }
 
-// RequestDrivenWebServicePlacement represents where to place tasks for a Request-Driven Web Service.
-type RequestDrivenWebServicePlacement Placement
+func (c *RequestDrivenWebServiceNetworkConfig) requiredEnvFeatures() []string {
+	if aws.StringValue((*string)(c.VPC.Placement.PlacementString)) == string(PrivateSubnetPlacement) {
+		return []string{template.NATFeatureName}
+	}
+	return nil
+}
 
 type rdwsVpcConfig struct {
-	Placement *RequestDrivenWebServicePlacement `yaml:"placement"`
+	Placement PlacementArgOrString `yaml:"placement"`
 }
 
 func (c *rdwsVpcConfig) isEmpty() bool {
-	return c.Placement == nil
+	return c.Placement.IsEmpty()
 }
 
 // RequestDrivenWebServiceHttpConfig represents options for configuring http.
 type RequestDrivenWebServiceHttpConfig struct {
-	HealthCheckConfiguration HealthCheckArgsOrString `yaml:"healthcheck"`
-	Alias                    *string                 `yaml:"alias"`
+	HealthCheckConfiguration HealthCheckArgsOrString   `yaml:"healthcheck"`
+	Alias                    *string                   `yaml:"alias"`
+	Private                  Union[*bool, VPCEndpoint] `yaml:"private"`
+}
+
+// VPCEndpoint is used to configure a pre-existing VPC endpoint.
+type VPCEndpoint struct {
+	Endpoint *string `yaml:"endpoint"`
 }
 
 // AppRunnerInstanceConfig contains the instance configuration properties for an App Runner service.
@@ -89,6 +106,7 @@ type RequestDrivenWebServiceProps struct {
 	*WorkloadProps
 	Port     uint16
 	Platform PlatformArgsOrString
+	Private  bool
 }
 
 // NewRequestDrivenWebService creates a new Request-Driven Web Service manifest with default values.
@@ -99,6 +117,10 @@ func NewRequestDrivenWebService(props *RequestDrivenWebServiceProps) *RequestDri
 	svc.RequestDrivenWebServiceConfig.ImageConfig.Image.Build.BuildArgs.Dockerfile = stringP(props.Dockerfile)
 	svc.RequestDrivenWebServiceConfig.ImageConfig.Port = aws.Uint16(props.Port)
 	svc.RequestDrivenWebServiceConfig.InstanceConfig.Platform = props.Platform
+	if props.Private {
+		svc.Private = BasicToUnion[*bool, VPCEndpoint](aws.Bool(true))
+		svc.Network.VPC.Placement.PlacementString = (*PlacementString)(aws.String("private"))
+	}
 	svc.parser = template.New()
 	return svc
 }
@@ -113,6 +135,11 @@ func (s *RequestDrivenWebService) MarshalBinary() ([]byte, error) {
 	return content.Bytes(), nil
 }
 
+// Dockerfile returns the relative path of the Dockerfile in the manifest.
+func (s *RequestDrivenWebService) Dockerfile() string {
+	return s.ImageConfig.Image.dockerfilePath()
+}
+
 // Port returns the exposed the exposed port in the manifest.
 // A RequestDrivenWebService always has a port exposed therefore the boolean is always true.
 func (s *RequestDrivenWebService) Port() (port uint16, ok bool) {
@@ -121,12 +148,7 @@ func (s *RequestDrivenWebService) Port() (port uint16, ok bool) {
 
 // Publish returns the list of topics where notifications can be published.
 func (s *RequestDrivenWebService) Publish() []Topic {
-	return s.RequestDrivenWebServiceConfig.PublishConfig.Topics
-}
-
-// BuildRequired returns if the service requires building from the local Dockerfile.
-func (s *RequestDrivenWebService) BuildRequired() (bool, error) {
-	return requiresBuild(s.ImageConfig.Image)
+	return s.RequestDrivenWebServiceConfig.PublishConfig.publishedTopics()
 }
 
 // ContainerPlatform returns the platform for the service.
@@ -137,14 +159,21 @@ func (s *RequestDrivenWebService) ContainerPlatform() string {
 	return platformString(s.InstanceConfig.Platform.OS(), s.InstanceConfig.Platform.Arch())
 }
 
-// BuildArgs returns a docker.BuildArguments object given a ws root directory.
-func (s *RequestDrivenWebService) BuildArgs(wsRoot string) *DockerBuildArgs {
-	return s.ImageConfig.Image.BuildConfig(wsRoot)
+// BuildArgs returns a docker.BuildArguments object given a context directory.
+func (s *RequestDrivenWebService) BuildArgs(contextDir string) (map[string]*DockerBuildArgs, error) {
+	required, err := requiresBuild(s.ImageConfig.Image)
+	if err != nil {
+		return nil, err
+	}
+	// Creating an map to store buildArgs of all sidecar images and main container image.
+	buildArgsPerContainer := make(map[string]*DockerBuildArgs, 1)
+	if required {
+		buildArgsPerContainer[aws.StringValue(s.Name)] = s.ImageConfig.Image.BuildConfig(contextDir)
+	}
+	return buildArgsPerContainer, nil
 }
 
-// ApplyEnv returns the service manifest with environment overrides.
-// If the environment passed in does not have any overrides then it returns itself.
-func (s RequestDrivenWebService) ApplyEnv(envName string) (WorkloadManifest, error) {
+func (s RequestDrivenWebService) applyEnv(envName string) (workloadManifest, error) {
 	overrideConfig, ok := s.Environments[envName]
 	if !ok {
 		return &s, nil
@@ -158,16 +187,21 @@ func (s RequestDrivenWebService) ApplyEnv(envName string) (WorkloadManifest, err
 			return nil, err
 		}
 	}
-
 	s.Environments = nil
 	return &s, nil
+}
+
+func (s *RequestDrivenWebService) requiredEnvironmentFeatures() []string {
+	var features []string
+	features = append(features, s.Network.requiredEnvFeatures()...)
+	return features
 }
 
 // newDefaultRequestDrivenWebService returns an empty RequestDrivenWebService with only the default values set.
 func newDefaultRequestDrivenWebService() *RequestDrivenWebService {
 	return &RequestDrivenWebService{
 		Workload: Workload{
-			Type: aws.String(RequestDrivenWebServiceType),
+			Type: aws.String(manifestinfo.RequestDrivenWebServiceType),
 		},
 		RequestDrivenWebServiceConfig: RequestDrivenWebServiceConfig{
 			ImageConfig: ImageWithPort{},

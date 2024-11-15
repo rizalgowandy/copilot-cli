@@ -4,18 +4,21 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"strings"
+	"unicode"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/describe"
-	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
 	"github.com/aws/copilot-cli/internal/pkg/term/log"
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
@@ -29,10 +32,11 @@ const (
 )
 
 type showSvcVars struct {
-	shouldOutputJSON      bool
-	shouldOutputResources bool
 	appName               string
 	svcName               string
+	shouldOutputJSON      bool
+	shouldOutputResources bool
+	outputManifestForEnv  string
 }
 
 type showSvcOpts struct {
@@ -40,7 +44,7 @@ type showSvcOpts struct {
 
 	w             io.Writer
 	store         store
-	describer     describer
+	describer     workloadDescriber
 	sel           configSelector
 	initDescriber func() error // Overridden in tests.
 
@@ -65,49 +69,34 @@ func newShowSvcOpts(vars showSvcVars) (*showSvcOpts, error) {
 		showSvcVars: vars,
 		store:       ssmStore,
 		w:           log.OutputWriter,
-		sel:         selector.NewConfigSelect(prompt.New(), ssmStore),
+		sel:         selector.NewConfigSelector(prompt.New(), ssmStore),
 	}
 	opts.initDescriber = func() error {
-		var d describer
+		var d workloadDescriber
 		svc, err := opts.getTargetSvc()
 		if err != nil {
 			return err
 		}
+		config := describe.NewServiceConfig{
+			App:             opts.appName,
+			Svc:             opts.svcName,
+			ConfigStore:     ssmStore,
+			DeployStore:     deployStore,
+			EnableResources: opts.shouldOutputResources,
+		}
 		switch svc.Type {
-		case manifest.LoadBalancedWebServiceType:
-			d, err = describe.NewLBWebServiceDescriber(describe.NewServiceConfig{
-				App:             opts.appName,
-				Svc:             opts.svcName,
-				ConfigStore:     ssmStore,
-				DeployStore:     deployStore,
-				EnableResources: opts.shouldOutputResources,
-			})
-		case manifest.RequestDrivenWebServiceType:
-			d, err = describe.NewRDWebServiceDescriber(describe.NewServiceConfig{
-				App:             opts.appName,
-				Svc:             opts.svcName,
-				ConfigStore:     ssmStore,
-				DeployStore:     deployStore,
-				EnableResources: opts.shouldOutputResources,
-			})
-		case manifest.BackendServiceType:
-			d, err = describe.NewBackendServiceDescriber(describe.NewServiceConfig{
-				App:             opts.appName,
-				Svc:             opts.svcName,
-				ConfigStore:     ssmStore,
-				DeployStore:     deployStore,
-				EnableResources: opts.shouldOutputResources,
-			})
-		case manifest.WorkerServiceType:
-			d, err = describe.NewWorkerServiceDescriber(describe.NewServiceConfig{
-				App:             opts.appName,
-				Svc:             opts.svcName,
-				ConfigStore:     ssmStore,
-				DeployStore:     deployStore,
-				EnableResources: opts.shouldOutputResources,
-			})
+		case manifestinfo.LoadBalancedWebServiceType:
+			d, err = describe.NewLBWebServiceDescriber(config)
+		case manifestinfo.RequestDrivenWebServiceType:
+			d, err = describe.NewRDWebServiceDescriber(config)
+		case manifestinfo.BackendServiceType:
+			d, err = describe.NewBackendServiceDescriber(config)
+		case manifestinfo.WorkerServiceType:
+			d, err = describe.NewWorkerServiceDescriber(config)
+		case manifestinfo.StaticSiteType:
+			d, err = describe.NewStaticSiteDescriber(config)
 		default:
-			return fmt.Errorf("invalid service type %s", svc.Type)
+			return fmt.Errorf(`service type %q is not supported for %s`, svc.Type, color.HighlightCode("svc show"))
 		}
 
 		if err != nil {
@@ -140,6 +129,10 @@ func (o *showSvcOpts) Execute() error {
 	if err := o.initDescriber(); err != nil {
 		return err
 	}
+
+	if o.outputManifestForEnv != "" {
+		return o.writeManifest()
+	}
 	svc, err := o.describer.Describe()
 	if err != nil {
 		return fmt.Errorf("describe service %s: %w", o.svcName, err)
@@ -163,7 +156,7 @@ func (o *showSvcOpts) validateOrAskApp() error {
 		_, err := o.store.GetApplication(o.appName)
 		return err
 	}
-	appName, err := o.sel.Application(svcAppNamePrompt, svcAppNameHelpPrompt)
+	appName, err := o.sel.Application(svcAppNamePrompt, wkldAppNameHelpPrompt)
 	if err != nil {
 		return fmt.Errorf("select application name: %w", err)
 	}
@@ -198,6 +191,20 @@ func (o *showSvcOpts) getTargetSvc() (*config.Workload, error) {
 	return o.targetSvc, nil
 }
 
+func (o *showSvcOpts) writeManifest() error {
+	out, err := o.describer.Manifest(o.outputManifestForEnv)
+	if err != nil {
+		var errNotFound *describe.ErrManifestNotFoundInTemplate
+		if errors.As(err, &errNotFound) {
+			log.Infof("You must deploy a new version of your service before printing its manifest:\n%s\n",
+				color.HighlightCodeBlock(fmt.Sprintf(" copilot deploy -n %s -e %s", o.svcName, o.outputManifestForEnv)))
+		}
+		return fmt.Errorf("fetch manifest for service %q in environment %q: %v", o.svcName, o.outputManifestForEnv, err)
+	}
+	fmt.Fprintln(o.w, strings.TrimRightFunc(string(out), unicode.IsSpace))
+	return nil
+}
+
 // buildSvcShowCmd builds the command for showing services in an application.
 func buildSvcShowCmd() *cobra.Command {
 	vars := showSvcVars{}
@@ -207,8 +214,10 @@ func buildSvcShowCmd() *cobra.Command {
 		Long:  "Shows info about a deployed service, including endpoints, capacity and related resources per environment.",
 
 		Example: `
-  Shows info about the service "my-svc"
-  /code $ copilot svc show -n my-svc`,
+  Print service configuration in deployed environments.
+  /code $ copilot svc show -n api
+  Print manifest file used for deploying service "api" in the "prod" environment.
+  /code $ copilot svc show -n api --manifest prod`,
 		RunE: runCmdE(func(cmd *cobra.Command, args []string) error {
 			opts, err := newShowSvcOpts(vars)
 			if err != nil {
@@ -221,5 +230,9 @@ func buildSvcShowCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&vars.svcName, nameFlag, nameFlagShort, "", svcFlagDescription)
 	cmd.Flags().BoolVar(&vars.shouldOutputJSON, jsonFlag, false, jsonFlagDescription)
 	cmd.Flags().BoolVar(&vars.shouldOutputResources, resourcesFlag, false, svcResourcesFlagDescription)
+	cmd.Flags().StringVar(&vars.outputManifestForEnv, manifestFlag, "", svcManifestFlagDescription)
+
+	cmd.MarkFlagsMutuallyExclusive(jsonFlag, manifestFlag)
+	cmd.MarkFlagsMutuallyExclusive(resourcesFlag, manifestFlag)
 	return cmd
 }

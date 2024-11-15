@@ -6,14 +6,13 @@ package sidecars_test
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"os"
 	"strings"
 
 	"github.com/aws/copilot-cli/e2e/internal/client"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -28,11 +27,14 @@ type: Load Balanced Web Service
 
 image:
   # Path to your service's Dockerfile.
-  build: hello/Dockerfile
+  location: %s
   # Port exposed through your container to route traffic to it.
   port: 3000
   depends_on:
     nginx: start
+env_file: ./magic.env
+
+platform: linux/x86_64
 
 http:
   # Requests to this path will be forwarded to your service. 
@@ -48,14 +50,17 @@ cpu: 256
 memory: 512
 # Number of tasks that should be running in your service.
 count: 1
-
 sidecars:
   nginx:
     port: 80
-    image: %s    # Image URL for sidecar container.
+    image:
+      build: nginx/Dockerfile
+      context: ./nginx
     variables:
-      NGINX_PORT: %s
+      NGINX_PORT: 80
+    env_file: ./magic.env
 logging:
+  env_file: ./magic.env
   destination:
     Name: cloudwatch
     region: us-east-1
@@ -63,10 +68,31 @@ logging:
     log_stream_prefix: copilot/
 `
 
-const nginxPort = "80"
+var mainImageURI string
 
 var _ = Describe("sidecars flow", func() {
-	Context("when creating a new app", func() {
+	Context("build and push main image to ECR repo", func() {
+		var uri string
+		var err error
+		It("create new ECR repo for main container", func() {
+			uri, err = aws.CreateECRRepo(mainRepoName)
+			Expect(err).NotTo(HaveOccurred(), "create ECR repo for main container")
+			mainImageURI = fmt.Sprintf("%s:mytag", uri)
+		})
+		It("push main container image", func() {
+			var password string
+			password, err = aws.ECRLoginPassword()
+			Expect(err).NotTo(HaveOccurred(), "get ecr login password")
+			err = docker.Login(uri, password)
+			Expect(err).NotTo(HaveOccurred(), "docker login")
+			err = docker.Build(mainImageURI, "./hello")
+			Expect(err).NotTo(HaveOccurred(), "build main container image")
+			err = docker.Push(mainImageURI)
+			Expect(err).NotTo(HaveOccurred(), "push to ECR repo")
+		})
+	})
+
+	Context("when creating a new app", Ordered, func() {
 		var (
 			initErr error
 		)
@@ -96,16 +122,15 @@ var _ = Describe("sidecars flow", func() {
 		})
 	})
 
-	Context("when creating a new environment", func() {
+	Context("when adding a new environment", Ordered, func() {
 		var (
 			testEnvInitErr error
 		)
 		BeforeAll(func() {
 			_, testEnvInitErr = cli.EnvInit(&client.EnvInitRequest{
 				AppName: appName,
-				EnvName: "test",
-				Profile: "default",
-				Prod:    false,
+				EnvName: envName,
+				Profile: envName,
 			})
 		})
 
@@ -114,16 +139,30 @@ var _ = Describe("sidecars flow", func() {
 		})
 	})
 
-	Context("when creating a service", func() {
+	Context("when deploying the environment", Ordered, func() {
+		var envDeployErr error
+		BeforeAll(func() {
+			_, envDeployErr = cli.EnvDeploy(&client.EnvDeployRequest{
+				AppName: appName,
+				Name:    envName,
+			})
+		})
+
+		It("should succeed", func() {
+			Expect(envDeployErr).NotTo(HaveOccurred())
+		})
+	})
+
+	Context("when creating a service", Ordered, func() {
 		var (
 			svcInitErr error
 		)
 		BeforeAll(func() {
 			_, svcInitErr = cli.SvcInit(&client.SvcInitRequest{
-				Name:       svcName,
-				SvcType:    "Load Balanced Web Service",
-				Dockerfile: "./hello/Dockerfile",
-				SvcPort:    "3000",
+				Name:    svcName,
+				SvcType: "Load Balanced Web Service",
+				Image:   mainImageURI,
+				SvcPort: "3000",
 			})
 		})
 
@@ -152,66 +191,46 @@ var _ = Describe("sidecars flow", func() {
 		})
 	})
 
-	Context("build and push sidecar image to ECR repo", func() {
-		var uri string
-		var err error
-		tag := "vortexstreet"
-		It("create new ECR repo for sidecar", func() {
-			uri, err = aws.CreateECRRepo(sidecarRepoName)
-			Expect(err).NotTo(HaveOccurred(), "create ECR repo for sidecar")
-			sidecarImageURI = fmt.Sprintf("%s:%s", uri, tag)
-		})
-		It("push sidecar image", func() {
-			var password string
-			password, err = aws.ECRLoginPassword()
-			Expect(err).NotTo(HaveOccurred(), "get ecr login password")
-			err = docker.Login(uri, password)
-			Expect(err).NotTo(HaveOccurred(), "docker login")
-			err = docker.Build(sidecarImageURI, "./nginx")
-			Expect(err).NotTo(HaveOccurred(), "build sidecar image")
-			err = docker.Push(sidecarImageURI)
-			Expect(err).NotTo(HaveOccurred(), "push to ECR repo")
-		})
-	})
-
 	Context("write local manifest and addon files", func() {
 		var newManifest string
 		It("overwrite existing manifest", func() {
 			logGroupName := fmt.Sprintf("%s-test-%s", appName, svcName)
-			newManifest = fmt.Sprintf(manifest, sidecarImageURI, nginxPort, logGroupName)
-			err := ioutil.WriteFile("./copilot/hello/manifest.yml", []byte(newManifest), 0644)
+			newManifest = fmt.Sprintf(manifest, mainImageURI, logGroupName)
+			err := os.WriteFile("./copilot/hello/manifest.yml", []byte(newManifest), 0644)
 			Expect(err).NotTo(HaveOccurred(), "overwrite manifest")
 		})
 		It("add addons folder for Firelens permissions", func() {
 			err := os.MkdirAll("./copilot/hello/addons", 0777)
 			Expect(err).NotTo(HaveOccurred(), "create addons dir")
 
-			fds, err := ioutil.ReadDir("./hello/addons")
+			fds, err := os.ReadDir("./hello/addons")
 			Expect(err).NotTo(HaveOccurred(), "read addons dir")
 
 			for _, fd := range fds {
-				destFile, err := os.Create(fmt.Sprintf("./copilot/hello/addons/%s", fd.Name()))
-				Expect(err).NotTo(HaveOccurred(), "create destination file")
-				defer destFile.Close()
+				func() {
+					destFile, err := os.Create(fmt.Sprintf("./copilot/hello/addons/%s", fd.Name()))
+					Expect(err).NotTo(HaveOccurred(), "create destination file")
+					defer destFile.Close()
 
-				srcFile, err := os.Open(fmt.Sprintf("./hello/addons/%s", fd.Name()))
-				Expect(err).NotTo(HaveOccurred(), "open source file")
-				defer srcFile.Close()
+					srcFile, err := os.Open(fmt.Sprintf("./hello/addons/%s", fd.Name()))
+					Expect(err).NotTo(HaveOccurred(), "open source file")
+					defer srcFile.Close()
 
-				_, err = io.Copy(destFile, srcFile)
-				Expect(err).NotTo(HaveOccurred(), "copy file")
+					_, err = io.Copy(destFile, srcFile)
+					Expect(err).NotTo(HaveOccurred(), "copy file")
+				}()
 			}
 		})
 	})
 
-	Context("when deploying svc", func() {
+	Context("when deploying svc", Ordered, func() {
 		var (
 			appDeployErr error
 		)
 		BeforeAll(func() {
 			_, appDeployErr = cli.SvcDeploy(&client.SvcDeployInput{
 				Name:     svcName,
-				EnvName:  "test",
+				EnvName:  envName,
 				ImageTag: "gallopinggurdey",
 			})
 		})
@@ -230,7 +249,7 @@ var _ = Describe("sidecars flow", func() {
 
 			// Call each environment's endpoint and ensure it returns a 200
 			route := svc.Routes[0]
-			Expect(route.Environment).To(Equal("test"))
+			Expect(route.Environment).To(Equal(envName))
 			uri := route.URL + "/health-check"
 
 			// Service should be ready.
@@ -243,9 +262,18 @@ var _ = Describe("sidecars flow", func() {
 
 			// Read the response - our deployed apps should return a body with their
 			// name as the value.
-			bodyBytes, err := ioutil.ReadAll(resp.Body)
+			bodyBytes, err := io.ReadAll(resp.Body)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(string(bodyBytes)).To(Equal("Ready"))
+		})
+
+		It("should have env file in sidecar definitions", func() {
+			taskDefinitionName := fmt.Sprintf("%s-%s-%s", appName, envName, svcName)
+			envFiles, err := aws.GetEnvFilesFromTaskDefinition(taskDefinitionName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(envFiles).To(HaveKey(svcName))
+			Expect(envFiles).To(HaveKey("nginx"))
+			Expect(envFiles).To(HaveKey("firelens_log_router"))
 		})
 
 		It("svc logs should display logs", func() {
@@ -256,7 +284,7 @@ var _ = Describe("sidecars flow", func() {
 				svcLogs, svcLogsErr = cli.SvcLogs(&client.SvcLogsRequest{
 					AppName: appName,
 					Name:    svcName,
-					EnvName: "test",
+					EnvName: envName,
 					Since:   "1h",
 				})
 				if svcLogsErr != nil {

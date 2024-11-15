@@ -27,8 +27,12 @@ const (
 	taskTaskRoleParamKey       = "TaskRole"
 	taskCommandParamKey        = "Command"
 	taskEntryPointParamKey     = "EntryPoint"
+	taskEnvFileARNParamKey     = "EnvFileARN"
 	taskOSParamKey             = "OS"
 	taskArchParamKey           = "Arch"
+
+	// TaskOutputS3Bucket is the CFN stack output logical ID for a task's S3 bucket.
+	TaskOutputS3Bucket = "S3Bucket"
 
 	taskLogRetentionInDays = "1"
 )
@@ -66,6 +70,7 @@ func (t *taskStackConfig) Template() (string, error) {
 		App                   string
 		Env                   string
 		ExecutionRole         string
+		PermissionsBoundary   string
 	}{
 		EnvVars:               t.EnvVars,
 		SSMParamSecrets:       t.SSMParamSecrets,
@@ -73,6 +78,7 @@ func (t *taskStackConfig) Template() (string, error) {
 		App:                   t.App,
 		Env:                   t.Env,
 		ExecutionRole:         t.ExecutionRole,
+		PermissionsBoundary:   t.PermissionsBoundary,
 	}, template.WithFuncs(cfnFuntion))
 	if err != nil {
 		return "", fmt.Errorf("read template for task stack: %w", err)
@@ -114,6 +120,10 @@ func (t *taskStackConfig) Parameters() ([]*cloudformation.Parameter, error) {
 		{
 			ParameterKey:   aws.String(taskEntryPointParamKey),
 			ParameterValue: aws.String(strings.Join(t.EntryPoint, ",")),
+		},
+		{
+			ParameterKey:   aws.String(taskEnvFileARNParamKey),
+			ParameterValue: aws.String(t.EnvFileARN),
 		},
 		{
 			ParameterKey:   aws.String(taskOSParamKey),

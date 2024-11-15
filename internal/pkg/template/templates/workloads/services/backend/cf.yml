@@ -2,6 +2,12 @@
 # SPDX-License-Identifier: MIT-0
 AWSTemplateFormatVersion: 2010-09-09
 Description: CloudFormation template that represents a backend service on Amazon ECS.
+Metadata:
+  Version: {{ .Version }}
+{{- if .SerializedManifest }}
+  Manifest: |
+{{indent 4 .SerializedManifest}}
+{{- end }}
 Parameters:
   AppName:
     Type: String
@@ -27,16 +33,52 @@ Parameters:
     Description: 'URL of the environment file.'
     Type: String
     Default: ""
+{{- if .LogConfig}}
+  LoggingEnvFileARN:
+    Type: String
+    Description: 'URL of the environment file for the logging sidecar.'
+    Default: ""
+{{- end}}
+{{- range $sidecar := .Sidecars }}
+  EnvFileARNFor{{ logicalIDSafe $sidecar.Name}}:
+    Type: String
+    Description: 'URL of the environment file for the {{$sidecar.Name}} sidecar.'
+    Default: ""
+{{- end }}
+  ArtifactKeyARN:
+    Type: String
+    Description: 'KMS Key used for encrypting artifacts'
   LogRetention:
     Type: Number
     Default: 30
+  TargetContainer:
+    Type: String
+  TargetPort:
+    Type: Number
+  {{- if .ALBListener}}
+  HTTPSEnabled:
+    Type: String
+    AllowedValues: [true, false]
+  RulePath:
+    Type: String
+  {{- end}}
 Conditions:
+  IsGovCloud:
+    !Equals [!Ref "AWS::Partition", "aws-us-gov"]
   HasAddons:
     !Not [!Equals [!Ref AddonsTemplateURL, ""]]
   HasEnvFile:
     !Not [!Equals [!Ref EnvFileARN, ""]]
+{{- if .LogConfig}}
+  HasLoggingEnvFile:
+    !Not [!Equals [!Ref LoggingEnvFileARN, ""]]
+{{- end}}
+{{- range $sidecar := .Sidecars }}
+  HasEnvFileFor{{ logicalIDSafe $sidecar.Name}}:
+    !Not [!Equals [!Ref EnvFileARNFor{{ logicalIDSafe $sidecar.Name}}, ""]]
+{{- end }}
   ExposePort:
-    !Not [!Equals [!Ref ContainerPort, -1]]
+    !Not [!Equals [!Ref TargetPort, -1]]
 Resources:
 {{include "loggroup" . | indent 2}}
 
@@ -56,63 +98,59 @@ Resources:
 {{include "executionrole" . | indent 2}}
 {{include "taskrole" . | indent 2}}
 {{include "servicediscovery" . | indent 2}}
-{{- if .Autoscaling }}
+
+{{- if .Autoscaling}}
 {{include "autoscaling" . | indent 2}}
-  CustomResourceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: 2012-10-17
-        Statement:
-          -
-            Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      Path: /
-      Policies:
-        - PolicyName: "DelegateDesiredCountAccess"
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-            - Sid: ECS
-              Effect: Allow
-              Action:
-                - ecs:DescribeServices
-              Resource: "*"
-              Condition: 
-                ArnEquals: 
-                  'ecs:cluster':
-                    Fn::Sub:
-                      - arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}
-                      - ClusterName:
-                          Fn::ImportValue:
-                            !Sub '${AppName}-${EnvName}-ClusterId'
-            - Sid: ResourceGroups
-              Effect: Allow
-              Action:
-                - resource-groups:GetResources
-              Resource: "*"
-            - Sid: Tags
-              Effect: Allow
-              Action:
-                - "tag:GetResources"
-              Resource: "*"
-      ManagedPolicyArns:
-        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-{{- end }}
+{{- end}}
+
+{{- if .ALBListener}}
+{{include "alb" . | indent 2}}
+{{end}}
+{{include "rollback-alarms" . | indent 2}}
+
   Service:
-    DependsOn:
-    - EnvControllerAction
     Metadata:
       'aws:copilot:description': 'An ECS service to run and maintain your tasks in the environment cluster'
     Type: AWS::ECS::Service
+    DependsOn:
+      - EnvControllerAction
+      {{- if .ALBListener }}
+        {{- range $i, $rule := .ALBListener.Rules }}
+          {{- if $.ImportedALB}}
+            {{- if ne $.ImportedALB.HTTPSListenerARN ""}}
+      - HTTPSListenerRuleForImportedALB{{ if ne $i 0 }}{{ $i }}{{ end }}
+              {{- if ne $.ImportedALB.HTTPListenerARN ""}}
+      - HTTPListenerRedirectRuleForImportedALB{{ if ne $i 0 }}{{ $i }}{{ end }}
+              {{- end}}
+            {{- else if ne $.ImportedALB.HTTPListenerARN ""}}
+      - HTTPListenerRuleForImportedALB{{ if ne $i 0 }}{{ $i }}{{ end }}
+            {{- end}}
+          {{- else if $.ALBListener.IsHTTPS}}
+      - HTTPListenerRuleWithDomain{{ if ne $i 0 }}{{ $i }}{{ end }}
+      - HTTPSListenerRule{{ if ne $i 0 }}{{ $i }}{{ end }}
+          {{- else }}
+      - HTTPListenerRule{{ if ne $i 0 }}{{ $i }}{{ end }}
+          {{- end}}
+        {{- end }}
+      {{- end }}
     Properties:
-{{include "service-base-properties" . | indent 6}}
-      ServiceRegistries: !If [ExposePort, [{RegistryArn: !GetAtt DiscoveryService.Arn, Port: !Ref ContainerPort}], !Ref "AWS::NoValue"]
-
+      {{- "\n"}}{{ include "service-base-properties" . | indent 6 }}
+      ServiceRegistries: !If [ExposePort, [{RegistryArn: !GetAtt DiscoveryService.Arn, Port: !Ref TargetPort}], !Ref "AWS::NoValue"]
+      {{- if .ALBListener}}
+      {{- if .GracePeriod }}
+      HealthCheckGracePeriodSeconds: {{.GracePeriod}}
+      {{- end }}
+      LoadBalancers:
+        {{- range $i, $rule := .ALBListener.Rules}}
+        - ContainerName: {{$rule.TargetContainer}}
+          ContainerPort: {{$rule.TargetPort}}
+        {{- if $.ImportedALB}}
+          TargetGroupArn: !Ref TargetGroupForImportedALB{{ if ne $i 0 }}{{ $i }}{{ end }}
+        {{- else}}
+          TargetGroupArn: !Ref TargetGroup{{ if ne $i 0 }}{{ $i }}{{ end }}
+        {{- end}}
+        {{- end}}
+      {{- end }}
 {{include "efs-access-point" . | indent 2}}
 
 {{include "addons" . | indent 2}}

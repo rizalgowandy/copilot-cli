@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/aws/copilot-cli/e2e/internal/client"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -17,7 +17,7 @@ var cli *client.CLI
 var appName string
 var envName string
 
-/**
+/*
 The Init Suite runs through the copilot init workflow for a brand new
 application. It creates a single environment, deploys a service to it, and then
 tears it down.
@@ -32,7 +32,7 @@ var _ = BeforeSuite(func() {
 	cli = ecsCli
 	Expect(err).NotTo(HaveOccurred())
 	appName = fmt.Sprintf("e2e-init-%d", time.Now().Unix())
-	envName = "test"
+	envName = "dev"
 })
 
 var _ = AfterSuite(func() {
@@ -42,19 +42,9 @@ var _ = AfterSuite(func() {
 	_, err = cli.JobDelete("mailer")
 	Expect(err).NotTo(HaveOccurred())
 
-	_, err = cli.EnvDelete("test")
+	_, err = cli.EnvDelete("dev")
 	Expect(err).NotTo(HaveOccurred())
 
 	_, err = cli.AppDelete()
 	Expect(err).NotTo(HaveOccurred())
 })
-
-func BeforeAll(fn func()) {
-	first := true
-	BeforeEach(func() {
-		if first {
-			fn()
-			first = false
-		}
-	})
-}

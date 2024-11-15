@@ -5,19 +5,11 @@
 package selector
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
 
 	"github.com/aws/copilot-cli/internal/pkg/aws/ec2"
-)
-
-var (
-	// ErrVPCNotFound is returned when no existing VPCs are found.
-	ErrVPCNotFound = errors.New("no existing VPCs found")
-	// ErrSubnetsNotFound is returned when no existing subnets are found.
-	ErrSubnetsNotFound = errors.New("no existing subnets found")
 )
 
 // VPCSubnetLister list VPCs and subnets.
@@ -68,7 +60,7 @@ func (s *EC2Select) VPC(msg, help string) (string, error) {
 	return extractedVPC.ID, nil
 }
 
-// SubnetInputs holds the arguments for the subnet selector.
+// SubnetsInput holds the arguments for the subnet selector.
 type SubnetsInput struct {
 	Msg   string
 	Help  string

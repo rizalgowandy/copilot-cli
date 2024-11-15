@@ -30,7 +30,8 @@ const (
 	// App Runner ImageRepositoryTypes
 	repositoryTypeECR       = "ECR"
 	repositoryTypeECRPublic = "ECR_PUBLIC"
-	// App Runner EndpointsID
+
+	// EndpointsID is the ID to look up the App Runner service endpoint.
 	EndpointsID = apprunner.EndpointsID
 )
 
@@ -41,6 +42,8 @@ type api interface {
 	PauseService(input *apprunner.PauseServiceInput) (*apprunner.PauseServiceOutput, error)
 	ResumeService(input *apprunner.ResumeServiceInput) (*apprunner.ResumeServiceOutput, error)
 	StartDeployment(input *apprunner.StartDeploymentInput) (*apprunner.StartDeploymentOutput, error)
+	DescribeObservabilityConfiguration(input *apprunner.DescribeObservabilityConfigurationInput) (*apprunner.DescribeObservabilityConfigurationOutput, error)
+	DescribeVpcIngressConnection(input *apprunner.DescribeVpcIngressConnectionInput) (*apprunner.DescribeVpcIngressConnectionOutput, error)
 }
 
 // AppRunner wraps an AWS AppRunner client.
@@ -72,6 +75,27 @@ func (a *AppRunner) DescribeService(svcARN string) (*Service, error) {
 	}
 	sort.SliceStable(envVars, func(i int, j int) bool { return envVars[i].Name < envVars[j].Name })
 
+	var secrets []*EnvironmentSecret
+	for k, v := range resp.Service.SourceConfiguration.ImageRepository.ImageConfiguration.RuntimeEnvironmentSecrets {
+		secrets = append(secrets, &EnvironmentSecret{
+			Name:  k,
+			Value: aws.StringValue(v),
+		})
+	}
+	sort.SliceStable(secrets, func(i int, j int) bool { return secrets[i].Name < secrets[j].Name })
+
+	var observabilityConfiguration ObservabilityConfiguration
+	if resp.Service.ObservabilityConfiguration != nil && aws.BoolValue(resp.Service.ObservabilityConfiguration.ObservabilityEnabled) {
+		if out, err := a.client.DescribeObservabilityConfiguration(&apprunner.DescribeObservabilityConfigurationInput{
+			ObservabilityConfigurationArn: resp.Service.ObservabilityConfiguration.ObservabilityConfigurationArn,
+		}); err == nil {
+			// NOTE: swallow the error otherwise, because observability is an optional description of the service.
+			// Example error: when "EnvManagerRole" doesn't have the "apprunner:ObservabilityConfiguration" permission.
+			observabilityConfiguration = ObservabilityConfiguration{
+				TraceConfiguration: (*TraceConfiguration)(out.ObservabilityConfiguration.TraceConfiguration),
+			}
+		}
+	}
 	return &Service{
 		ServiceARN:           aws.StringValue(resp.Service.ServiceArn),
 		Name:                 aws.StringValue(resp.Service.ServiceName),
@@ -85,6 +109,8 @@ func (a *AppRunner) DescribeService(svcARN string) (*Service, error) {
 		Memory:               *resp.Service.InstanceConfiguration.Memory,
 		ImageID:              *resp.Service.SourceConfiguration.ImageRepository.ImageIdentifier,
 		Port:                 *resp.Service.SourceConfiguration.ImageRepository.ImageConfiguration.Port,
+		Observability:        observabilityConfiguration,
+		EnvironmentSecrets:   secrets,
 	}, nil
 }
 
@@ -197,6 +223,18 @@ func (a *AppRunner) WaitForOperation(operationId, svcARN string) error {
 		}
 		time.Sleep(3 * time.Second)
 	}
+}
+
+// PrivateURL returns the url associated with a VPC Ingress Connection.
+func (a *AppRunner) PrivateURL(vicARN string) (string, error) {
+	resp, err := a.client.DescribeVpcIngressConnection(&apprunner.DescribeVpcIngressConnectionInput{
+		VpcIngressConnectionArn: aws.String(vicARN),
+	})
+	if err != nil {
+		return "", fmt.Errorf("describe vpc ingress connection %q: %w", vicARN, err)
+	}
+
+	return aws.StringValue(resp.VpcIngressConnection.DomainName), nil
 }
 
 // ParseServiceName returns the service name.

@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 AWSTemplateFormatVersion: '2010-09-09'
 Description: CodePipeline for phonetool
+Metadata:
+  Version: v1.28.0
 Resources:
   BuildProjectRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -34,7 +36,7 @@ Resources:
     Properties:
       PolicyName: !Sub ${AWS::StackName}-CodeBuildPolicy
       PolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Action:
@@ -118,7 +120,7 @@ Resources:
         Type: LINUX_CONTAINER
         ComputeType: BUILD_GENERAL1_SMALL
         PrivilegedMode: true
-        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
         EnvironmentVariables:
           - Name: AWS_ACCOUNT_ID
             Value: !Sub '${AWS::AccountId}'
@@ -132,7 +134,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -146,7 +148,7 @@ Resources:
     Properties:
       PolicyName: !Sub ${AWS::StackName}-CodepipelinePolicy
       PolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Action:
@@ -209,7 +211,7 @@ Resources:
         Type: NO_ARTIFACTS
       Environment:
         Type: LINUX_CONTAINER
-        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
         ComputeType: BUILD_GENERAL1_SMALL
         PrivilegedMode: true
       Source:
@@ -217,9 +219,6 @@ Resources:
         BuildSpec: |
           version: 0.2
           phases:
-            install:
-                runtime-versions:
-                  docker: 18
             build:
               commands:
                 - echo "test"
@@ -238,7 +237,6 @@ Resources:
               Id: arn:aws:kms:us-west-2:1111:key/abcd
               Type: KMS
       RoleArn: !GetAtt PipelineRole.Arn
-      Name: !Ref AWS::StackName
       Stages:
         - Name: Source
           Actions:
@@ -280,8 +278,6 @@ Resources:
                 Version: 1
                 Provider: CloudFormation
               Configuration:
-                # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/continuous-delivery-codepipeline-action-reference.html
-                ChangeSetName: phonetool-staging-test-api
                 ActionMode: CREATE_UPDATE
                 StackName: phonetool-staging-test-api
                 Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
@@ -293,7 +289,7 @@ Resources:
                 RoleArn: arn:aws:iam::1111:role/phonetool-staging-test-CFNExecutionRole
               InputArtifacts:
                 - Name: BuildOutput
-              RunOrder: 2
+              RunOrder: 1
               # The ARN of the environment manager IAM role (in the env
               # account) that performs the declared action. This is assumed
               # through the roleArn for the pipeline.
@@ -306,6 +302,6 @@ Resources:
                 Provider: CodeBuild
               Configuration:
                 ProjectName: !Ref BuildTestCommandsstagingDASHtest
-              RunOrder: 3
+              RunOrder: 2
               InputArtifacts:
                 - Name: SCCheckoutArtifact

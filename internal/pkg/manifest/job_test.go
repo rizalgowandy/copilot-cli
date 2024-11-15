@@ -4,100 +4,13 @@
 package manifest
 
 import (
-	"io/ioutil"
-	"path/filepath"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
+	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/stretchr/testify/require"
 )
-
-func TestScheduledJob_MarshalBinary(t *testing.T) {
-	testCases := map[string]struct {
-		inProps ScheduledJobProps
-
-		wantedTestData string
-	}{
-		"without timeout or retries": {
-			inProps: ScheduledJobProps{
-				WorkloadProps: &WorkloadProps{
-					Name:  "cuteness-aggregator",
-					Image: "copilot/cuteness-aggregator",
-				},
-				Platform: PlatformArgsOrString{
-					PlatformString: nil,
-					PlatformArgs:   PlatformArgs{},
-				},
-				Schedule: "@weekly",
-			},
-			wantedTestData: "scheduled-job-no-timeout-or-retries.yml",
-		},
-		"fully specified using cron schedule": {
-			inProps: ScheduledJobProps{
-				WorkloadProps: &WorkloadProps{
-					Name:       "cuteness-aggregator",
-					Dockerfile: "./cuteness-aggregator/Dockerfile",
-				},
-				Platform: PlatformArgsOrString{
-					PlatformString: nil,
-					PlatformArgs:   PlatformArgs{},
-				},
-				Schedule: "0 */2 * * *",
-				Retries:  3,
-				Timeout:  "1h30m",
-			},
-			wantedTestData: "scheduled-job-fully-specified.yml",
-		},
-		"with timeout and no retries": {
-			inProps: ScheduledJobProps{
-				WorkloadProps: &WorkloadProps{
-					Name:       "cuteness-aggregator",
-					Dockerfile: "./cuteness-aggregator/Dockerfile",
-				},
-				Platform: PlatformArgsOrString{
-					PlatformString: nil,
-					PlatformArgs:   PlatformArgs{},
-				},
-				Schedule: "@every 5h",
-				Retries:  0,
-				Timeout:  "3h",
-			},
-			wantedTestData: "scheduled-job-no-retries.yml",
-		},
-		"with retries and no timeout": {
-			inProps: ScheduledJobProps{
-				WorkloadProps: &WorkloadProps{
-					Name:       "cuteness-aggregator",
-					Dockerfile: "./cuteness-aggregator/Dockerfile",
-				},
-				Platform: PlatformArgsOrString{
-					PlatformString: nil,
-					PlatformArgs:   PlatformArgs{},
-				},
-				Schedule: "@every 5h",
-				Retries:  5,
-			},
-			wantedTestData: "scheduled-job-no-timeout.yml",
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			// GIVEN
-			path := filepath.Join("testdata", tc.wantedTestData)
-			wantedBytes, err := ioutil.ReadFile(path)
-			require.NoError(t, err)
-			manifest := NewScheduledJob(&tc.inProps)
-
-			// WHEN
-			tpl, err := manifest.MarshalBinary()
-			require.NoError(t, err)
-
-			// THEN
-			require.Equal(t, string(wantedBytes), string(tpl))
-		})
-	}
-}
 
 func TestScheduledJob_ApplyEnv(t *testing.T) {
 	testCases := map[string]struct {
@@ -117,12 +30,14 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 			inputManifest: &ScheduledJob{
 				Workload: Workload{
 					Name: aws.String("report-generator"),
-					Type: aws.String(ScheduledJobType),
+					Type: aws.String(manifestinfo.ScheduledJobType),
 				},
 				ScheduledJobConfig: ScheduledJobConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Location: aws.String("nginx"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Location: aws.String("nginx"),
+							},
 						},
 					},
 					On: JobTriggerConfig{
@@ -141,15 +56,21 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement: placementP(PublicSubnetPlacement),
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
 						},
 					},
 				},
 				Environments: map[string]*ScheduledJobConfig{
 					"prod": {
 						TaskConfig: TaskConfig{
-							Variables: map[string]string{
-								"LOG_LEVEL": "prod",
+							Variables: map[string]Variable{
+								"LOG_LEVEL": {
+									StringOrFromCFN{
+										Plain: stringP("prod"),
+									},
+								},
 							},
 						},
 					},
@@ -160,12 +81,14 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 			wantedManifest: &ScheduledJob{
 				Workload: Workload{
 					Name: aws.String("report-generator"),
-					Type: aws.String(ScheduledJobType),
+					Type: aws.String(manifestinfo.ScheduledJobType),
 				},
 				ScheduledJobConfig: ScheduledJobConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Location: aws.String("nginx"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Location: aws.String("nginx"),
+							},
 						},
 					},
 					On: JobTriggerConfig{
@@ -181,13 +104,19 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 						Count: Count{
 							Value: aws.Int(1),
 						},
-						Variables: map[string]string{
-							"LOG_LEVEL": "prod",
+						Variables: map[string]Variable{
+							"LOG_LEVEL": {
+								StringOrFromCFN{
+									Plain: stringP("prod"),
+								},
+							},
 						},
 					},
 					Network: NetworkConfig{
 						VPC: vpcConfig{
-							Placement: placementP(PublicSubnetPlacement),
+							Placement: PlacementArgOrString{
+								PlacementString: placementStringP(PublicSubnetPlacement),
+							},
 						},
 					},
 				},
@@ -198,14 +127,16 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 			inputManifest: &ScheduledJob{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(ScheduledJobType),
+					Type: aws.String(manifestinfo.ScheduledJobType),
 				},
 				ScheduledJobConfig: ScheduledJobConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Build: BuildArgsOrString{
-								BuildArgs: DockerBuildArgs{
-									Dockerfile: aws.String("./Dockerfile"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildArgs: DockerBuildArgs{
+										Dockerfile: aws.String("./Dockerfile"),
+									},
 								},
 							},
 						},
@@ -215,7 +146,9 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 					"prod-iad": {
 						ImageConfig: ImageWithHealthcheck{
 							Image: Image{
-								Location: aws.String("env-override location"),
+								ImageLocationOrBuild: ImageLocationOrBuild{
+									Location: aws.String("env-override location"),
+								},
 							},
 						},
 					},
@@ -226,12 +159,14 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 			wantedManifest: &ScheduledJob{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(ScheduledJobType),
+					Type: aws.String(manifestinfo.ScheduledJobType),
 				},
 				ScheduledJobConfig: ScheduledJobConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Location: aws.String("env-override location"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Location: aws.String("env-override location"),
+							},
 						},
 					},
 				},
@@ -241,12 +176,14 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 			inputManifest: &ScheduledJob{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(ScheduledJobType),
+					Type: aws.String(manifestinfo.ScheduledJobType),
 				},
 				ScheduledJobConfig: ScheduledJobConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Location: aws.String("default location"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Location: aws.String("default location"),
+							},
 						},
 					},
 				},
@@ -254,7 +191,9 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 					"prod-iad": {
 						ImageConfig: ImageWithHealthcheck{
 							Image: Image{
-								Location: aws.String("env-override location"),
+								ImageLocationOrBuild: ImageLocationOrBuild{
+									Location: aws.String("env-override location"),
+								},
 							},
 						},
 					},
@@ -265,12 +204,14 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 			wantedManifest: &ScheduledJob{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(ScheduledJobType),
+					Type: aws.String(manifestinfo.ScheduledJobType),
 				},
 				ScheduledJobConfig: ScheduledJobConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Location: aws.String("env-override location"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Location: aws.String("env-override location"),
+							},
 						},
 					},
 				},
@@ -280,14 +221,16 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 			inputManifest: &ScheduledJob{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(ScheduledJobType),
+					Type: aws.String(manifestinfo.ScheduledJobType),
 				},
 				ScheduledJobConfig: ScheduledJobConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Build: BuildArgsOrString{
-								BuildArgs: DockerBuildArgs{
-									Dockerfile: aws.String("./Dockerfile"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildArgs: DockerBuildArgs{
+										Dockerfile: aws.String("./Dockerfile"),
+									},
 								},
 							},
 						},
@@ -297,8 +240,10 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 					"prod-iad": {
 						ImageConfig: ImageWithHealthcheck{
 							Image: Image{
-								Build: BuildArgsOrString{
-									BuildString: aws.String("overridden build string"),
+								ImageLocationOrBuild: ImageLocationOrBuild{
+									Build: BuildArgsOrString{
+										BuildString: aws.String("overridden build string"),
+									},
 								},
 							},
 						},
@@ -310,13 +255,15 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 			wantedManifest: &ScheduledJob{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(ScheduledJobType),
+					Type: aws.String(manifestinfo.ScheduledJobType),
 				},
 				ScheduledJobConfig: ScheduledJobConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Build: BuildArgsOrString{
-								BuildString: aws.String("overridden build string"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildString: aws.String("overridden build string"),
+								},
 							},
 						},
 					},
@@ -327,12 +274,14 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 			inputManifest: &ScheduledJob{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(ScheduledJobType),
+					Type: aws.String(manifestinfo.ScheduledJobType),
 				},
 				ScheduledJobConfig: ScheduledJobConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Location: aws.String("default location"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Location: aws.String("default location"),
+							},
 						},
 					},
 				},
@@ -340,8 +289,10 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 					"prod-iad": {
 						ImageConfig: ImageWithHealthcheck{
 							Image: Image{
-								Build: BuildArgsOrString{
-									BuildString: aws.String("overridden build string"),
+								ImageLocationOrBuild: ImageLocationOrBuild{
+									Build: BuildArgsOrString{
+										BuildString: aws.String("overridden build string"),
+									},
 								},
 							},
 						},
@@ -353,13 +304,15 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 			wantedManifest: &ScheduledJob{
 				Workload: Workload{
 					Name: aws.String("phonetool"),
-					Type: aws.String(ScheduledJobType),
+					Type: aws.String(manifestinfo.ScheduledJobType),
 				},
 				ScheduledJobConfig: ScheduledJobConfig{
 					ImageConfig: ImageWithHealthcheck{
 						Image: Image{
-							Build: BuildArgsOrString{
-								BuildString: aws.String("overridden build string"),
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildString: aws.String("overridden build string"),
+								},
 							},
 						},
 					},
@@ -371,7 +324,7 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			// WHEN
-			actualManifest, actualErr := tc.inputManifest.ApplyEnv(tc.inputEnv)
+			actualManifest, actualErr := tc.inputManifest.applyEnv(tc.inputEnv)
 
 			// THEN
 			if tc.wantedErr != nil {
@@ -380,6 +333,78 @@ func TestScheduledJob_ApplyEnv(t *testing.T) {
 				require.NoError(t, actualErr)
 				require.Equal(t, tc.wantedManifest, actualManifest)
 			}
+		})
+	}
+}
+
+func TestScheduledJob_RequiredEnvironmentFeatures(t *testing.T) {
+	testCases := map[string]struct {
+		mft    func(svc *ScheduledJob)
+		wanted []string
+	}{
+		"no feature required by default": {
+			mft: func(svc *ScheduledJob) {},
+		},
+		"nat feature required": {
+			mft: func(svc *ScheduledJob) {
+				svc.Network = NetworkConfig{
+					VPC: vpcConfig{
+						Placement: PlacementArgOrString{
+							PlacementString: placementStringP(PrivateSubnetPlacement),
+						},
+					},
+				}
+			},
+			wanted: []string{template.NATFeatureName},
+		},
+		"efs feature required by enabling managed volume": {
+			mft: func(svc *ScheduledJob) {
+				svc.Storage = Storage{
+					Volumes: map[string]*Volume{
+						"mock-managed-volume-1": {
+							EFS: EFSConfigOrBool{
+								Enabled: aws.Bool(true),
+							},
+						},
+						"mock-imported-volume": {
+							EFS: EFSConfigOrBool{
+								Advanced: EFSVolumeConfiguration{
+									FileSystemID: StringOrFromCFN{Plain: aws.String("fs-12345")},
+								},
+							},
+						},
+					},
+				}
+			},
+			wanted: []string{template.EFSFeatureName},
+		},
+		"efs feature not required because storage is imported": {
+			mft: func(svc *ScheduledJob) {
+				svc.Storage = Storage{
+					Volumes: map[string]*Volume{
+						"mock-imported-volume": {
+							EFS: EFSConfigOrBool{
+								Advanced: EFSVolumeConfiguration{
+									FileSystemID: StringOrFromCFN{Plain: aws.String("fs-12345")},
+								},
+							},
+						},
+					},
+				}
+			},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			inSvc := ScheduledJob{
+				Workload: Workload{
+					Name: aws.String("mock-svc"),
+					Type: aws.String(manifestinfo.ScheduledJobType),
+				},
+			}
+			tc.mft(&inSvc)
+			got := inSvc.requiredEnvironmentFeatures()
+			require.Equal(t, tc.wanted, got)
 		})
 	}
 }
@@ -420,6 +445,79 @@ func TestScheduledJob_Publish(t *testing.T) {
 
 			// THEN
 			require.Equal(t, tc.wantedTopics, actual)
+		})
+	}
+}
+
+func TestScheduledJob_Dockerfile(t *testing.T) {
+	testCases := map[string]struct {
+		input                  *ScheduledJob
+		expectedDockerfilePath string
+	}{
+		"specific dockerfile from buildargs": {
+			input: &ScheduledJob{
+				ScheduledJobConfig: ScheduledJobConfig{
+					ImageConfig: ImageWithHealthcheck{
+						Image: Image{
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildArgs: DockerBuildArgs{
+										Dockerfile: aws.String("path/to/Dockerfile"),
+									},
+									BuildString: aws.String("other/path/to/Dockerfile"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedDockerfilePath: "path/to/Dockerfile",
+		},
+		"specific dockerfile from buildstring": {
+			input: &ScheduledJob{
+				ScheduledJobConfig: ScheduledJobConfig{
+					ImageConfig: ImageWithHealthcheck{
+						Image: Image{
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildString: aws.String("path/to/Dockerfile"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedDockerfilePath: "path/to/Dockerfile",
+		},
+		"dockerfile from context": {
+			input: &ScheduledJob{
+				ScheduledJobConfig: ScheduledJobConfig{
+					ImageConfig: ImageWithHealthcheck{
+						Image: Image{
+							ImageLocationOrBuild: ImageLocationOrBuild{
+								Build: BuildArgsOrString{
+									BuildArgs: DockerBuildArgs{
+										Context: aws.String("path/to"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedDockerfilePath: "path/to/Dockerfile",
+		},
+	}
+
+	for name, tc := range testCases {
+		svc := tc.input
+
+		t.Run(name, func(t *testing.T) {
+			// WHEN
+			dockerfilePath := svc.Dockerfile()
+
+			// THEN
+			require.Equal(t, tc.expectedDockerfilePath, dockerfilePath)
 		})
 	}
 }

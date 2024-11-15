@@ -8,7 +8,18 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
+
+	"github.com/aws/copilot-cli/internal/pkg/aws/profile"
+	"github.com/aws/copilot-cli/internal/pkg/describe"
+	"github.com/aws/copilot-cli/internal/pkg/manifest"
+	"github.com/aws/copilot-cli/internal/pkg/version"
+	"github.com/aws/copilot-cli/internal/pkg/workspace"
+	"github.com/dustin/go-humanize/english"
+	"github.com/spf13/afero"
+	"golang.org/x/mod/semver"
 
 	"github.com/aws/aws-sdk-go/service/ssm"
 
@@ -19,14 +30,12 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/aws/iam"
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
 	"github.com/aws/copilot-cli/internal/pkg/aws/partitions"
-	"github.com/aws/copilot-cli/internal/pkg/aws/profile"
 	"github.com/aws/copilot-cli/internal/pkg/aws/s3"
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	deploycfn "github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation"
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
-	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
 	"github.com/aws/copilot-cli/internal/pkg/term/log"
 	termprogress "github.com/aws/copilot-cli/internal/pkg/term/progress"
@@ -37,8 +46,6 @@ import (
 )
 
 const (
-	envInitAppNameHelpPrompt = "An environment will be created in the selected application."
-
 	envInitNamePrompt              = "What is your environment's name?"
 	envInitNameHelpPrompt          = "A unique identifier for an environment (e.g. dev, test, prod)."
 	envInitDefaultEnvConfirmPrompt = `Would you like to use the default configuration for a new environment?
@@ -69,13 +76,9 @@ https://aws.github.io/copilot-cli/docs/credentials/#environment-credentials`
 	fmtDNSDelegationStart    = "Sharing DNS permissions for this application to account %s."
 	fmtDNSDelegationFailed   = "Failed to grant DNS permissions to account %s.\n\n"
 	fmtDNSDelegationComplete = "Shared DNS permissions for this application to account %s.\n\n"
-	fmtAddEnvToAppStart      = "Linking account %s and region %s to application %s."
-	fmtAddEnvToAppFailed     = "Failed to link account %s and region %s to application %s.\n\n"
-	fmtAddEnvToAppComplete   = "Linked account %s and region %s to application %s.\n\n"
 )
 
 var (
-	envInitAppNamePrompt                  = fmt.Sprintf("In which %s would you like to create the environment?", color.Emphasize("application"))
 	envInitDefaultConfigSelectOption      = "Yes, use default."
 	envInitAdjustEnvResourcesSelectOption = "Yes, but I'd like configure the default resources (CIDR ranges, AZs)."
 	envInitImportEnvResourcesSelectOption = "No, I'd like to import existing resources (VPC, subnets)."
@@ -135,15 +138,19 @@ func (v telemetryVars) toConfig() *config.Telemetry {
 }
 
 type initEnvVars struct {
-	appName       string
-	name          string // Name for the environment.
-	profile       string // The named profile to use for credential retrieval. Mutually exclusive with tempCreds.
-	isProduction  bool   // True means retain resources even after deletion.
-	defaultConfig bool   // True means using default environment configuration.
+	appName           string
+	name              string // Name for the environment.
+	profile           string // The named profile to use for credential retrieval. Mutually exclusive with tempCreds.
+	isProduction      bool   // True means retain resources even after deletion.
+	defaultConfig     bool   // True means using default environment configuration.
+	allowAppDowngrade bool
 
-	importVPC importVPCVars // Existing VPC resources to use instead of creating new ones.
-	adjustVPC adjustVPCVars // Configure parameters for VPC resources generated while initializing an environment.
-	telemetry telemetryVars // Configure observability and monitoring settings.
+	importVPC          importVPCVars // Existing VPC resources to use instead of creating new ones.
+	adjustVPC          adjustVPCVars // Configure parameters for VPC resources generated while initializing an environment.
+	telemetry          telemetryVars // Configure observability and monitoring settings.
+	importCerts        []string      // Additional existing ACM certificates to use.
+	internalALBSubnets []string      // Subnets to be used for internal ALB placement.
+	allowVPCIngress    bool          // True means the env stack will create ingress to the internal ALB from ports 80/443.
 
 	tempCreds tempCredsVars // Temporary credentials to initialize the environment. Mutually exclusive with the profile.
 	region    string        // The region to create the environment in.
@@ -153,25 +160,33 @@ type initEnvOpts struct {
 	initEnvVars
 
 	// Interfaces to interact with dependencies.
-	sessProvider sessionProvider
-	store        store
-	envDeployer  deployer
-	appDeployer  deployer
-	identity     identityService
-	envIdentity  identityService
-	ec2Client    ec2Client
-	iam          roleManager
-	cfn          stackExistChecker
-	prog         progress
-	prompt       prompter
-	selVPC       ec2Selector
-	selCreds     credsSelector
-	selApp       appSelector
-	appCFN       appResourcesGetter
-	newS3        func(string) (uploader, error)
-	uploader     customResourcesUploader
+	sessProvider        sessionProvider
+	store               store
+	envDeployer         deployer
+	appDeployer         deployer
+	identity            identityService
+	envIdentity         identityService
+	ec2Client           ec2Client
+	newAppVersionGetter func(appName string) (versionGetter, error)
+	iam                 roleManager
+	cfn                 stackExistChecker
+	prog                progress
+	prompt              prompter
+	selVPC              ec2Selector
+	selCreds            func() (credsSelector, error)
+	selApp              appSelector
+	appCFN              appResourcesGetter
+	manifestWriter      environmentManifestWriter
+	envLister           wsEnvironmentsLister
 
 	sess *session.Session // Session pointing to environment's AWS account and region.
+
+	// Cached variables.
+	wsAppName        string
+	mftDisplayedPath string
+
+	// Overridden in tests.
+	templateVersion string
 }
 
 func newInitEnvOpts(vars initEnvVars) (*initEnvOpts, error) {
@@ -181,41 +196,50 @@ func newInitEnvOpts(vars initEnvVars) (*initEnvOpts, error) {
 		return nil, err
 	}
 	store := config.NewSSMStore(identity.New(defaultSession), ssm.New(defaultSession), aws.StringValue(defaultSession.Config.Region))
-
-	cfg, err := profile.NewConfig()
-	if err != nil {
-		return nil, fmt.Errorf("read named profiles: %w", err)
-	}
-
 	prompter := prompt.New()
+	ws, err := workspace.Use(afero.NewOsFs())
+	if err != nil {
+		return nil, err
+	}
 	return &initEnvOpts{
 		initEnvVars:  vars,
 		sessProvider: sessProvider,
 		store:        store,
-		appDeployer:  deploycfn.New(defaultSession),
+		appDeployer:  deploycfn.New(defaultSession, deploycfn.WithProgressTracker(os.Stderr)),
 		identity:     identity.New(defaultSession),
 		prog:         termprogress.NewSpinner(log.DiagnosticWriter),
 		prompt:       prompter,
-		selCreds: &selector.CredsSelect{
-			Session: sessProvider,
-			Profile: cfg,
-			Prompt:  prompter,
-		},
-		selApp:   selector.NewSelect(prompt.New(), store),
-		uploader: template.New(),
-		appCFN:   deploycfn.New(defaultSession),
-		newS3: func(region string) (uploader, error) {
-			sess, err := sessProvider.DefaultWithRegion(region)
+		selCreds: func() (credsSelector, error) {
+			cfg, err := profile.NewConfig()
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("read named profiles: %w", err)
 			}
-			return s3.New(sess), nil
+			return &selector.CredsSelect{
+				Session: sessProvider,
+				Profile: cfg,
+				Prompt:  prompt.New(),
+			}, nil
 		},
+		newAppVersionGetter: func(appName string) (versionGetter, error) {
+			return describe.NewAppDescriber(appName)
+		},
+		selApp:         selector.NewAppEnvSelector(prompt.New(), store),
+		appCFN:         deploycfn.New(defaultSession, deploycfn.WithProgressTracker(os.Stderr)),
+		manifestWriter: ws,
+		envLister:      ws,
+
+		wsAppName:       tryReadingAppName(),
+		templateVersion: version.LatestTemplateVersion(),
 	}, nil
 }
 
 // Validate returns an error if the values passed by flags are invalid.
 func (o *initEnvOpts) Validate() error {
+	if err := validateWorkspaceApp(o.wsAppName, o.appName, o.store); err != nil {
+		return err
+	}
+	o.appName = o.wsAppName
+
 	if o.name != "" {
 		if err := validateEnvironmentName(o.name); err != nil {
 			return err
@@ -233,9 +257,6 @@ func (o *initEnvOpts) Validate() error {
 
 // Ask asks for fields that are required but not passed in.
 func (o *initEnvOpts) Ask() error {
-	if err := o.askAppName(); err != nil {
-		return err
-	}
 	if err := o.askEnvName(); err != nil {
 		return err
 	}
@@ -250,30 +271,48 @@ func (o *initEnvOpts) Ask() error {
 
 // Execute deploys a new environment with CloudFormation and adds it to SSM.
 func (o *initEnvOpts) Execute() error {
-	o.initRuntimeClients()
-	app, err := o.store.GetApplication(o.appName)
-	if err != nil {
-		// Ensure the app actually exists before we do a deployment.
+	if err := o.initRuntimeClients(); err != nil {
 		return err
 	}
-
+	if !o.allowAppDowngrade {
+		versionGetter, err := o.newAppVersionGetter(o.appName)
+		if err != nil {
+			return err
+		}
+		if err := validateAppVersion(versionGetter, o.appName, o.templateVersion); err != nil {
+			return err
+		}
+	}
+	app, err := o.store.GetApplication(o.appName)
+	if err != nil {
+		// Ensure the app actually exists before we write the manifest.
+		return err
+	}
 	envCaller, err := o.envIdentity.Get()
 	if err != nil {
 		return fmt.Errorf("get identity: %w", err)
 	}
 
-	if app.RequiresDNSDelegation() {
+	// 1. Write environment manifest.
+	path, err := o.writeManifest()
+	if err != nil {
+		return err
+	}
+	o.mftDisplayedPath = path
+
+	// 2. Perform DNS delegation from app to env.
+	if app.Domain != "" {
 		if err := o.delegateDNSFromApp(app, envCaller.Account); err != nil {
 			return fmt.Errorf("granting DNS permissions: %w", err)
 		}
 	}
 
-	// 1. Attempt to create the service linked role if it doesn't exist.
+	// 3. Attempt to create the service linked role if it doesn't exist.
 	// If the call fails because the role already exists, nothing to do.
 	// If the call fails because the user doesn't have permissions, then the role must be created outside of Copilot.
 	_ = o.iam.CreateECSServiceLinkedRole()
 
-	// 2. Add the stack set instance to the app stackset.
+	// 4. Add the stack set instance to the app stackset.
 	if err := o.addToStackset(&deploycfn.AddEnvToAppOpts{
 		App:          app,
 		EnvName:      o.name,
@@ -283,67 +322,41 @@ func (o *initEnvOpts) Execute() error {
 		return err
 	}
 
-	// 3. Upload environment custom resource scripts to the S3 bucket, because of the 4096 characters limit (see
-	// https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-lambda-function-code.html#cfn-lambda-function-code-zipfile)
-	envRegion := aws.StringValue(o.sess.Config.Region)
-	resources, err := o.appCFN.GetAppResourcesByRegion(app, envRegion)
-	if err != nil {
-		return fmt.Errorf("get app resources: %w", err)
-	}
-	s3Client, err := o.newS3(envRegion)
-	if err != nil {
-		return err
-	}
-	urls, err := o.uploader.UploadEnvironmentCustomResources(s3.CompressAndUploadFunc(func(key string, objects ...s3.NamedBinary) (string, error) {
-		return s3Client.ZipAndUpload(resources.S3Bucket, key, objects...)
-	}))
-	if err != nil {
-		return fmt.Errorf("upload custom resources to bucket %s: %w", resources.S3Bucket, err)
-	}
-
-	// 4. Start creating the CloudFormation stack for the environment.
-	if resources.S3Bucket == "" {
-		log.Errorf("Cannot find the S3 artifact bucket in %s region created by app %s. The S3 bucket is necessary for many future operations. For example, when you need addons to your services.", envRegion, app.Name)
-		return fmt.Errorf("cannot find the S3 artifact bucket in %s region", envRegion)
-	}
-	partition, err := partitions.Region(envRegion).Partition()
-	if err != nil {
-		return err
-	}
-	if err := o.deployEnv(app, s3.FormatARN(partition.ID(), resources.S3Bucket), resources.KMSKeyARN, urls); err != nil {
+	// 5. Start creating the CloudFormation stack for the environment.
+	if err := o.deployEnv(app); err != nil {
 		return err
 	}
 
-	// 5. Get the environment
+	// 6. Store the environment in SSM with information about the deployed bootstrap roles.
 	env, err := o.envDeployer.GetEnvironment(o.appName, o.name)
 	if err != nil {
 		return fmt.Errorf("get environment struct for %s: %w", o.name, err)
 	}
-	env.Prod = o.isProduction
-	env.CustomConfig = config.NewCustomizeEnv(o.importVPCConfig(), o.adjustVPCConfig())
-	env.Telemetry = o.telemetry.toConfig()
-
-	// 6. Store the environment in SSM.
 	if err := o.store.CreateEnvironment(env); err != nil {
 		return fmt.Errorf("store environment: %w", err)
 	}
-	log.Successf("Created environment %s in region %s under application %s.\n",
+	log.Successf("Provisioned bootstrap resources for environment %s in region %s under application %s.\n",
 		color.HighlightUserInput(env.Name), color.Emphasize(env.Region), color.HighlightUserInput(env.App))
 	return nil
 }
 
 // RecommendActions returns follow-up actions the user can take after successfully executing the command.
 func (o *initEnvOpts) RecommendActions() error {
+	logRecommendedActions([]string{
+		fmt.Sprintf("Update your manifest %s to change the defaults.", color.HighlightResource(o.mftDisplayedPath)),
+		fmt.Sprintf("Run %s to deploy your environment.",
+			color.HighlightCode(fmt.Sprintf("copilot env deploy --name %s", o.name))),
+	})
 	return nil
 }
 
-func (o *initEnvOpts) initRuntimeClients() {
+func (o *initEnvOpts) initRuntimeClients() error {
 	// Initialize environment clients if not set.
 	if o.envIdentity == nil {
 		o.envIdentity = identity.New(o.sess)
 	}
 	if o.envDeployer == nil {
-		o.envDeployer = deploycfn.New(o.sess)
+		o.envDeployer = deploycfn.New(o.sess, deploycfn.WithProgressTracker(os.Stderr))
 	}
 	if o.cfn == nil {
 		o.cfn = cloudformation.New(o.sess)
@@ -351,6 +364,7 @@ func (o *initEnvOpts) initRuntimeClients() {
 	if o.iam == nil {
 		o.iam = iam.New(o.sess)
 	}
+	return nil
 }
 
 func (o *initEnvOpts) validateCustomizedResources() error {
@@ -360,6 +374,11 @@ func (o *initEnvOpts) validateCustomizedResources() error {
 	if (o.importVPC.isSet() || o.adjustVPC.isSet()) && o.defaultConfig {
 		return fmt.Errorf("cannot import or configure vpc if --%s is set", defaultConfigFlag)
 	}
+	if o.internalALBSubnets != nil && (o.adjustVPC.isSet() || o.defaultConfig) {
+		log.Error(`To specify internal ALB subnet placement, you must import existing resources, including subnets.
+For default config without subnet placement specification, Copilot will place the internal ALB in the generated private subnets.`)
+		return fmt.Errorf("subnets '%s' specified for internal ALB placement, but those subnets are not imported", strings.Join(o.internalALBSubnets, ", "))
+	}
 	if o.importVPC.isSet() {
 		// Allow passing in VPC without subnets, but error out early for too few subnets-- we won't prompt the user to select more of one type if they pass in any.
 		if len(o.importVPC.PublicSubnetIDs) == 1 {
@@ -368,25 +387,15 @@ func (o *initEnvOpts) validateCustomizedResources() error {
 		if len(o.importVPC.PrivateSubnetIDs) == 1 {
 			return fmt.Errorf("at least two private subnets must be imported")
 		}
+		if err := o.validateInternalALBSubnets(); err != nil {
+			return err
+		}
 	}
 	if o.adjustVPC.isSet() {
 		if len(o.adjustVPC.AZs) == 1 {
 			return errors.New("at least two availability zones must be provided to enable Load Balancing")
 		}
 	}
-	return nil
-}
-
-func (o *initEnvOpts) askAppName() error {
-	if o.appName != "" {
-		return nil
-	}
-
-	app, err := o.selApp.Application(envInitAppNamePrompt, envInitAppNameHelpPrompt)
-	if err != nil {
-		return fmt.Errorf("ask for application: %w", err)
-	}
-	o.appName = app
 	return nil
 }
 
@@ -420,7 +429,19 @@ func (o *initEnvOpts) askEnvSession() error {
 		o.sess = sess
 		return nil
 	}
-	sess, err := o.selCreds.Creds(fmt.Sprintf(fmtEnvInitCredsPrompt, color.HighlightUserInput(o.name)), envInitCredsHelpPrompt)
+
+	selCreds, err := o.selCreds()
+	if err != nil {
+		errRetrieveCreds := err
+		sess, err := o.sessProvider.Default()
+		if err != nil {
+			return errors.Join(errRetrieveCreds, fmt.Errorf("falling back on default credentials: %w", err))
+		}
+		o.sess = sess
+		return nil
+	}
+
+	sess, err := selCreds.Creds(fmt.Sprintf(fmtEnvInitCredsPrompt, color.HighlightUserInput(o.name)), envInitCredsHelpPrompt)
 	if err != nil {
 		return fmt.Errorf("select creds: %w", err)
 	}
@@ -453,6 +474,10 @@ func (o *initEnvOpts) askCustomizedResources() error {
 	}
 	if o.adjustVPC.isSet() {
 		return o.askAdjustResources()
+	}
+	if o.internalALBSubnets != nil {
+		log.Infoln("Because you have designated subnets on which to place an internal ALB, you must import VPC resources.")
+		return o.askImportResources()
 	}
 	adjustOrImport, err := o.prompt.SelectOne(
 		envInitDefaultEnvConfirmPrompt, "",
@@ -558,7 +583,7 @@ be able to add them after this environment is created.
 	if len(o.importVPC.PublicSubnetIDs)+len(o.importVPC.PrivateSubnetIDs) == 0 {
 		return errors.New("VPC must have subnets in order to proceed with environment creation")
 	}
-	return nil
+	return o.validateInternalALBSubnets()
 }
 
 func (o *initEnvOpts) askAdjustResources() error {
@@ -583,7 +608,7 @@ func (o *initEnvOpts) askAdjustResources() error {
 		publicCIDR, err := o.prompt.Get(
 			envInitPublicCIDRPrompt, envInitPublicCIDRPromptHelp,
 			validatePublicSubnetsCIDR(len(o.adjustVPC.AZs)),
-			prompt.WithDefaultInput(stack.DefaultPublicSubnetCIDRs), prompt.WithFinalMessage("Public subnets CIDR:"))
+			prompt.WithDefaultInput(strings.Join(stack.DefaultPublicSubnetCIDRs, ",")), prompt.WithFinalMessage("Public subnets CIDR:"))
 		if err != nil {
 			return fmt.Errorf("get public subnet CIDRs: %w", err)
 		}
@@ -593,7 +618,7 @@ func (o *initEnvOpts) askAdjustResources() error {
 		privateCIDR, err := o.prompt.Get(
 			envInitPrivateCIDRPrompt, envInitPrivateCIDRPromptHelp,
 			validatePrivateSubnetsCIDR(len(o.adjustVPC.AZs)),
-			prompt.WithDefaultInput(stack.DefaultPrivateSubnetCIDRs), prompt.WithFinalMessage("Private subnets CIDR:"))
+			prompt.WithDefaultInput(strings.Join(stack.DefaultPrivateSubnetCIDRs, ",")), prompt.WithFinalMessage("Private subnets CIDR:"))
 		if err != nil {
 			return fmt.Errorf("get private subnet CIDRs: %w", err)
 		}
@@ -639,11 +664,27 @@ func (o *initEnvOpts) askAZs() ([]string, error) {
 func (o *initEnvOpts) validateDuplicateEnv() error {
 	_, err := o.store.GetEnvironment(o.appName, o.name)
 	if err == nil {
-		log.Errorf(`It seems like you are trying to init an environment that already exists.
-To recreate the environment, please run:
+		// Skip error if environment already exists in workspace
+		envs, err := o.envLister.ListEnvironments()
+		if err != nil {
+			return err
+		}
+		if slices.Contains(envs, o.name) {
+			return nil
+		}
+
+		dir := filepath.Join("copilot", "environments", o.name)
+		log.Infof(`It seems like you are trying to init an environment that already exists.
+To generate a manifest for the environment:
+1. %s
+2. %s
+
+Alternatively, to recreate the environment:
 1. %s
 2. And then %s
 `,
+			color.HighlightCode(fmt.Sprintf("mkdir -p %s", dir)),
+			color.HighlightCode(fmt.Sprintf("copilot env show -n %s --manifest > %s", o.name, filepath.Join(dir, "manifest.yml"))),
 			color.HighlightCode(fmt.Sprintf("copilot env delete --name %s", o.name)),
 			color.HighlightCode(fmt.Sprintf("copilot env init --name %s", o.name)))
 		return fmt.Errorf("environment %s already exists", color.HighlightUserInput(o.name))
@@ -679,34 +720,43 @@ func (o *initEnvOpts) adjustVPCConfig() *config.AdjustVPC {
 	}
 }
 
-func (o *initEnvOpts) deployEnv(app *config.Application,
-	artifactBucketARN, artifactBucketKeyARN string, customResourcesURLs map[string]string) error {
+func (o *initEnvOpts) deployEnv(app *config.Application) error {
+	envRegion := aws.StringValue(o.sess.Config.Region)
+	resources, err := o.appCFN.GetAppResourcesByRegion(app, envRegion)
+	if err != nil {
+		return fmt.Errorf("get app resources: %w", err)
+	}
+	if resources.S3Bucket == "" {
+		log.Errorf("Cannot find the S3 artifact bucket in %s region created by app %s. The S3 bucket is necessary for many future operations. For example, when you need addons to your services.", envRegion, app.Name)
+		return fmt.Errorf("cannot find the S3 artifact bucket in %s region", envRegion)
+	}
+	partition, err := partitions.Region(envRegion).Partition()
+	if err != nil {
+		return err
+	}
+	artifactBucketARN := s3.FormatARN(partition.ID(), resources.S3Bucket)
+
 	caller, err := o.identity.Get()
 	if err != nil {
 		return fmt.Errorf("get identity: %w", err)
 	}
-	deployEnvInput := &deploy.CreateEnvironmentInput{
+	deployEnvInput := &stack.EnvConfig{
 		Name: o.name,
 		App: deploy.AppInformation{
 			Name:                o.appName,
-			DNSName:             app.Domain,
+			Domain:              app.Domain,
 			AccountPrincipalARN: caller.RootUserARN,
 		},
-		Prod:                 o.isProduction,
 		AdditionalTags:       app.Tags,
-		CustomResourcesURLs:  customResourcesURLs,
 		ArtifactBucketARN:    artifactBucketARN,
-		ArtifactBucketKeyARN: artifactBucketKeyARN,
-		AdjustVPCConfig:      o.adjustVPCConfig(),
-		ImportVPCConfig:      o.importVPCConfig(),
-		Telemetry:            o.telemetry.toConfig(),
-		Version:              deploy.LatestEnvTemplateVersion,
+		ArtifactBucketKeyARN: resources.KMSKeyARN,
+		PermissionsBoundary:  app.PermissionsBoundary,
 	}
 
 	if err := o.cleanUpDanglingRoles(o.appName, o.name); err != nil {
 		return err
 	}
-	if err := o.envDeployer.DeployAndRenderEnvironment(os.Stderr, deployEnvInput); err != nil {
+	if err := o.envDeployer.CreateAndRenderEnvironment(stack.NewBootstrapEnvStackConfig(deployEnvInput), artifactBucketARN); err != nil {
 		var existsErr *cloudformation.ErrStackAlreadyExists
 		if errors.As(err, &existsErr) {
 			// Do nothing if the stack already exists.
@@ -721,13 +771,9 @@ func (o *initEnvOpts) deployEnv(app *config.Application,
 }
 
 func (o *initEnvOpts) addToStackset(opts *deploycfn.AddEnvToAppOpts) error {
-	o.prog.Start(fmt.Sprintf(fmtAddEnvToAppStart, color.Emphasize(opts.EnvAccountID), color.Emphasize(opts.EnvRegion), color.HighlightUserInput(o.appName)))
 	if err := o.appDeployer.AddEnvToApp(opts); err != nil {
-		o.prog.Stop(log.Serrorf(fmtAddEnvToAppFailed, color.Emphasize(opts.EnvAccountID), color.Emphasize(opts.EnvRegion), color.HighlightUserInput(o.appName)))
-		return fmt.Errorf("deploy env %s to application %s: %w", opts.EnvName, opts.App.Name, err)
+		return fmt.Errorf("add env %s to application %s: %w", opts.EnvName, opts.App.Name, err)
 	}
-	o.prog.Stop(log.Ssuccessf(fmtAddEnvToAppComplete, color.Emphasize(opts.EnvAccountID), color.Emphasize(opts.EnvRegion), color.HighlightUserInput(o.appName)))
-
 	return nil
 }
 
@@ -755,6 +801,28 @@ func (o *initEnvOpts) validateCredentials() error {
 	}
 	if o.profile != "" && o.tempCreds.SessionToken != "" {
 		return fmt.Errorf("cannot specify both --%s and --%s", profileFlag, sessionTokenFlag)
+	}
+	return nil
+}
+
+func (o *initEnvOpts) validateInternalALBSubnets() error {
+	if len(o.internalALBSubnets) == 0 {
+		return nil
+	}
+	isImported := make(map[string]bool)
+	for _, placementSubnet := range o.internalALBSubnets {
+		for _, subnet := range append(o.importVPC.PrivateSubnetIDs, o.importVPC.PublicSubnetIDs...) {
+			if placementSubnet == subnet {
+				isImported[placementSubnet] = true
+			}
+		}
+	}
+	if len(isImported) != len(o.internalALBSubnets) {
+		return fmt.Errorf("%s '%s' %s designated for ALB placement, but %s imported",
+			english.PluralWord(len(o.internalALBSubnets), "subnet", "subnets"),
+			strings.Join(o.internalALBSubnets, ", "),
+			english.PluralWord(len(o.internalALBSubnets), "was", "were"),
+			english.PluralWord(len(o.internalALBSubnets), "it was not", "they were not all"))
 	}
 	return nil
 }
@@ -797,6 +865,57 @@ func (o *initEnvOpts) tryDeletingEnvRoles(app, env string) {
 	}
 }
 
+func (o *initEnvOpts) writeManifest() (string, error) {
+	customizedEnv := &config.CustomizeEnv{
+		ImportVPC:                   o.importVPCConfig(),
+		VPCConfig:                   o.adjustVPCConfig(),
+		ImportCertARNs:              o.importCerts,
+		InternalALBSubnets:          o.internalALBSubnets,
+		EnableInternalALBVPCIngress: o.allowVPCIngress,
+	}
+	if customizedEnv.IsEmpty() {
+		customizedEnv = nil
+	}
+	props := manifest.EnvironmentProps{
+		Name:         o.name,
+		CustomConfig: customizedEnv,
+		Telemetry:    o.telemetry.toConfig(),
+	}
+
+	var manifestExists bool
+	manifestPath, err := o.manifestWriter.WriteEnvironmentManifest(manifest.NewEnvironment(&props), props.Name)
+	if err != nil {
+		e, ok := err.(*workspace.ErrFileExists)
+		if !ok {
+			return "", fmt.Errorf("write environment manifest: %w", err)
+		}
+		manifestExists = true
+		manifestPath = e.FileName
+	}
+	manifestPath = displayPath(manifestPath)
+	manifestMsgFmt := "Wrote the manifest for environment %s at %s\n"
+	if manifestExists {
+		manifestMsgFmt = "Manifest file for environment %s already exists at %s, skipping writing it.\n"
+	}
+	log.Successf(manifestMsgFmt, color.HighlightUserInput(props.Name), color.HighlightResource(manifestPath))
+	return manifestPath, nil
+}
+
+func validateAppVersion(vg versionGetter, name, templateVersion string) error {
+	appVersion, err := vg.Version()
+	if err != nil {
+		return fmt.Errorf("get template version of application %s: %w", name, err)
+	}
+	if diff := semver.Compare(appVersion, templateVersion); diff > 0 {
+		return &errCannotDowngradeAppVersion{
+			appName:         name,
+			appVersion:      appVersion,
+			templateVersion: templateVersion,
+		}
+	}
+	return nil
+}
+
 // buildEnvInitCmd builds the command for adding an environment.
 func buildEnvInitCmd() *cobra.Command {
 	vars := initEnvVars{}
@@ -811,10 +930,11 @@ func buildEnvInitCmd() *cobra.Command {
   Creates a prod-iad environment using your "prod-admin" AWS profile and enables container insights.
   /code $ copilot env init --name prod-iad --profile prod-admin --container-insights
 
-  Creates an environment with imported VPC resources.
+  Creates an environment with imported resources.
   /code $ copilot env init --import-vpc-id vpc-099c32d2b98cdcf47 \
   /code --import-public-subnets subnet-013e8b691862966cf,subnet-014661ebb7ab8681a \
-  /code --import-private-subnets subnet-055fafef48fb3c547,subnet-00c9e76f288363e7f
+  /code --import-private-subnets subnet-055fafef48fb3c547,subnet-00c9e76f288363e7f \
+  /code --import-cert-arns arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012
 
   Creates an environment with overridden CIDRs and AZs.
   /code $ copilot env init --override-vpc-cidr 10.1.0.0/16 \
@@ -836,6 +956,7 @@ func buildEnvInitCmd() *cobra.Command {
 	cmd.Flags().StringVar(&vars.tempCreds.SecretAccessKey, secretAccessKeyFlag, "", secretAccessKeyFlagDescription)
 	cmd.Flags().StringVar(&vars.tempCreds.SessionToken, sessionTokenFlag, "", sessionTokenFlagDescription)
 	cmd.Flags().StringVar(&vars.region, regionFlag, "", envRegionTokenFlagDescription)
+	cmd.Flags().BoolVar(&vars.allowAppDowngrade, allowDowngradeFlag, false, allowDowngradeFlagDescription)
 
 	cmd.Flags().BoolVar(&vars.isProduction, prodEnvFlag, false, prodEnvFlagDescription) // Deprecated. Use telemetry flags instead.
 	cmd.Flags().BoolVar(&vars.telemetry.EnableContainerInsights, enableContainerInsightsFlag, false, enableContainerInsightsFlagDescription)
@@ -843,12 +964,14 @@ func buildEnvInitCmd() *cobra.Command {
 	cmd.Flags().StringVar(&vars.importVPC.ID, vpcIDFlag, "", vpcIDFlagDescription)
 	cmd.Flags().StringSliceVar(&vars.importVPC.PublicSubnetIDs, publicSubnetsFlag, nil, publicSubnetsFlagDescription)
 	cmd.Flags().StringSliceVar(&vars.importVPC.PrivateSubnetIDs, privateSubnetsFlag, nil, privateSubnetsFlagDescription)
-
+	cmd.Flags().StringSliceVar(&vars.importCerts, certsFlag, nil, certsFlagDescription)
 	cmd.Flags().IPNetVar(&vars.adjustVPC.CIDR, overrideVPCCIDRFlag, net.IPNet{}, overrideVPCCIDRFlagDescription)
 	cmd.Flags().StringSliceVar(&vars.adjustVPC.AZs, overrideAZsFlag, nil, overrideAZsFlagDescription)
 	// TODO: use IPNetSliceVar when it is available (https://github.com/spf13/pflag/issues/273).
 	cmd.Flags().StringSliceVar(&vars.adjustVPC.PublicSubnetCIDRs, overridePublicSubnetCIDRsFlag, nil, overridePublicSubnetCIDRsFlagDescription)
 	cmd.Flags().StringSliceVar(&vars.adjustVPC.PrivateSubnetCIDRs, overridePrivateSubnetCIDRsFlag, nil, overridePrivateSubnetCIDRsFlagDescription)
+	cmd.Flags().StringSliceVar(&vars.internalALBSubnets, internalALBSubnetsFlag, nil, internalALBSubnetsFlagDescription)
+	cmd.Flags().BoolVar(&vars.allowVPCIngress, allowVPCIngressFlag, false, allowVPCIngressFlagDescription)
 	cmd.Flags().BoolVar(&vars.defaultConfig, defaultConfigFlag, false, defaultConfigFlagDescription)
 
 	flags := pflag.NewFlagSet("Common", pflag.ContinueOnError)
@@ -860,17 +983,21 @@ func buildEnvInitCmd() *cobra.Command {
 	flags.AddFlag(cmd.Flags().Lookup(sessionTokenFlag))
 	flags.AddFlag(cmd.Flags().Lookup(regionFlag))
 	flags.AddFlag(cmd.Flags().Lookup(defaultConfigFlag))
+	flags.AddFlag(cmd.Flags().Lookup(allowDowngradeFlag))
 
 	resourcesImportFlags := pflag.NewFlagSet("Import Existing Resources", pflag.ContinueOnError)
 	resourcesImportFlags.AddFlag(cmd.Flags().Lookup(vpcIDFlag))
 	resourcesImportFlags.AddFlag(cmd.Flags().Lookup(publicSubnetsFlag))
 	resourcesImportFlags.AddFlag(cmd.Flags().Lookup(privateSubnetsFlag))
+	resourcesImportFlags.AddFlag(cmd.Flags().Lookup(certsFlag))
 
 	resourcesConfigFlags := pflag.NewFlagSet("Configure Default Resources", pflag.ContinueOnError)
 	resourcesConfigFlags.AddFlag(cmd.Flags().Lookup(overrideVPCCIDRFlag))
 	resourcesConfigFlags.AddFlag(cmd.Flags().Lookup(overrideAZsFlag))
 	resourcesConfigFlags.AddFlag(cmd.Flags().Lookup(overridePublicSubnetCIDRsFlag))
 	resourcesConfigFlags.AddFlag(cmd.Flags().Lookup(overridePrivateSubnetCIDRsFlag))
+	resourcesConfigFlags.AddFlag(cmd.Flags().Lookup(internalALBSubnetsFlag))
+	resourcesConfigFlags.AddFlag(cmd.Flags().Lookup(allowVPCIngressFlag))
 
 	telemetryFlags := pflag.NewFlagSet("Telemetry", pflag.ContinueOnError)
 	telemetryFlags.AddFlag(cmd.Flags().Lookup(enableContainerInsightsFlag))

@@ -9,26 +9,26 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
-
-	"github.com/dustin/go-humanize/english"
-
-	"gopkg.in/yaml.v3"
-
 	"github.com/aws/aws-sdk-go/aws"
 	awsssm "github.com/aws/aws-sdk-go/service/ssm"
-
-	"github.com/spf13/afero"
-	"github.com/spf13/cobra"
-
+	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
 	"github.com/aws/copilot-cli/internal/pkg/aws/ssm"
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
+	"github.com/aws/copilot-cli/internal/pkg/describe"
+	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
 	"github.com/aws/copilot-cli/internal/pkg/term/log"
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
 	"github.com/aws/copilot-cli/internal/pkg/term/selector"
+	"github.com/aws/copilot-cli/internal/pkg/workspace"
+	"github.com/dustin/go-humanize/english"
+	"github.com/spf13/afero"
+	"github.com/spf13/cobra"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -58,19 +58,16 @@ type secretInitVars struct {
 
 type secretInitOpts struct {
 	secretInitVars
-
-	secretValues map[string]map[string]string
-
-	store store
-	fs    afero.Fs
-
-	prompter prompter
-	selector appSelector
-
 	shouldShowOverwriteHint bool
+	secretValues            map[string]map[string]string
 
-	envUpgradeCMDs map[string]actionCommand
-	secretPutters  map[string]secretPutter
+	store                   store
+	fs                      afero.Fs
+	prompter                prompter
+	selector                appSelector
+	ws                      wsEnvironmentsLister
+	envCompatibilityChecker map[string]versionCompatibilityChecker
+	secretPutters           map[string]secretPutter
 
 	configureClientsForEnv func(envName string) error
 	readFile               func() ([]byte, error)
@@ -82,30 +79,37 @@ func newSecretInitOpts(vars secretInitVars) (*secretInitOpts, error) {
 	if err != nil {
 		return nil, err
 	}
+	fs := afero.NewOsFs()
+	ws, err := workspace.Use(afero.NewOsFs())
+	if err != nil {
+		return nil, err
+	}
 
 	store := config.NewSSMStore(identity.New(defaultSession), awsssm.New(defaultSession), aws.StringValue(defaultSession.Config.Region))
 	prompter := prompt.New()
 	opts := secretInitOpts{
 		secretInitVars: vars,
 		store:          store,
-		fs:             &afero.Afero{Fs: afero.NewOsFs()},
+		fs:             fs,
+		ws:             ws,
 
-		envUpgradeCMDs: make(map[string]actionCommand),
-		secretPutters:  make(map[string]secretPutter),
+		envCompatibilityChecker: make(map[string]versionCompatibilityChecker),
+		secretPutters:           make(map[string]secretPutter),
 
 		prompter: prompter,
-		selector: selector.NewSelect(prompter, store),
+		selector: selector.NewAppEnvSelector(prompter, store),
 	}
 
 	opts.configureClientsForEnv = func(envName string) error {
-		cmd, err := newEnvUpgradeOpts(envUpgradeVars{
-			appName: opts.appName,
-			name:    envName,
+		checker, err := describe.NewEnvDescriber(describe.NewEnvDescriberConfig{
+			App:         opts.appName,
+			Env:         envName,
+			ConfigStore: opts.store,
 		})
 		if err != nil {
-			return fmt.Errorf("new env upgrade command: %v", err)
+			return fmt.Errorf("new environment compatibility checker: %v", err)
 		}
-		opts.envUpgradeCMDs[envName] = cmd
+		opts.envCompatibilityChecker[envName] = checker
 
 		env, err := opts.targetEnv(envName)
 		if err != nil {
@@ -247,8 +251,8 @@ func (o *secretInitOpts) configureClientsAndUpgradeForEnvironments(secrets map[s
 		if err := o.configureClientsForEnv(envName); err != nil {
 			return err
 		}
-		if err := o.envUpgradeCMDs[envName].Execute(); err != nil {
-			return fmt.Errorf(`execute "env upgrade --app %s --name %s": %v`, o.appName, envName, err)
+		if err := validateMinEnvVersion(o.ws, o.envCompatibilityChecker[envName], o.appName, envName, template.SecretInitMinEnvVersion, "secret init"); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -379,7 +383,7 @@ func (o *secretInitOpts) askForSecretValues() error {
 	}
 
 	if len(envs) == 0 {
-		log.Errorf("Secrets environment-level resources. Please run %s before running %s.\n",
+		log.Errorf("Secrets are environment-level resources. Please run %s before running %s.\n",
 			color.HighlightCode("copilot env init"),
 			color.HighlightCode("copilot secret init"))
 		return fmt.Errorf("no environment is found in app %s", o.appName)
@@ -390,7 +394,7 @@ func (o *secretInitOpts) askForSecretValues() error {
 		value, err := o.prompter.GetSecret(
 			fmt.Sprintf(fmtSecretInitSecretValuePrompt, color.HighlightUserInput(o.name), env.Name),
 			fmt.Sprintf(fmtSecretInitSecretValuePromptHelp, color.HighlightUserInput(o.name), env.Name),
-			prompt.WithFinalMessage(fmt.Sprintf("%s secret value:", strings.Title(env.Name))),
+			prompt.WithFinalMessage(fmt.Sprintf("%s secret value:", cases.Title(language.English).String(env.Name))),
 		)
 		if err != nil {
 			return fmt.Errorf("get secret value for %s in environment %s: %w", color.HighlightUserInput(o.name), env.Name, err)
@@ -413,7 +417,7 @@ func (o *secretInitOpts) RecommendActions() error {
 	}
 
 	log.Infoln("You can refer to these secrets from your manifest file by editing the `secrets` section.")
-	log.Infoln(color.HighlightCode(secretsManifestExample))
+	log.Infoln(color.HighlightCodeBlock(secretsManifestExample))
 	return nil
 }
 

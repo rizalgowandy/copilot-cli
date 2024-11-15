@@ -6,10 +6,10 @@
 
 ## シークレットの追加方法
 
-シークレットを追加するには、シークレットを SecureString として [AWS Systems Manager パラメータストア](https://docs.aws.amazon.com/ja_jp/systems-manager/latest/userguide/systems-manager-parameter-store.html) (SSM) 、または [AWS Secrets Manager](https://docs.aws.amazon.com/ja_jp/secretsmanager/latest/userguide/intro.html) に保存する必要があります。そして、SSM パラメータへの参照を [Manifest](../manifest/overview.ja.md) に追加します。
+シークレットを追加するには、シークレットを [AWS Systems Manager パラメータストア](https://docs.aws.amazon.com/ja_jp/systems-manager/latest/userguide/systems-manager-parameter-store.html) (SSM) 、
+または [AWS Secrets Manager](https://docs.aws.amazon.com/ja_jp/secretsmanager/latest/userguide/intro.html) に保存する必要があります。そして、SSM パラメータへの参照を [Manifest](../manifest/overview.ja.md) に追加します。
 
-[`copilot secret init`](../commands/secret-init.ja.md) コマンドを利用することで簡単にシークレットを作成できます！
-
+[`copilot secret init`](../commands/secret-init.ja.md) コマンドを利用することで、SSM に簡単に `SecureString` としてシークレットを作成できます！
 
 !!! attention
     Request-Driven Web Service はシークレットの利用をサポートしていません。
@@ -33,7 +33,7 @@ secrets:
   GITHUB_WEBHOOK_SECRET: GH_WEBHOOK_SECRET  
 ```
 
-更新されたマニフェストをデプロイすると、Service や Job は環境変数 `GITHUB_WEBHOOK_SECRET` にアクセスできるようになります。この環境変数には、SSM パラメータ `GH_WEBHOOK_SECRET` の値である `secretvalue1234` が格納されます。
+更新された Manifest をデプロイすると、Service や Job は環境変数 `GITHUB_WEBHOOK_SECRET` にアクセスできるようになります。この環境変数には、SSM パラメータ `GH_WEBHOOK_SECRET` の値である `secretvalue1234` が格納されます。
 これが機能するのは、ECS エージェントがタスクの開始時に SSM パラメータを解決し、環境変数を設定してくれるためです。
 
 ### Secrets Manager の場合
@@ -43,24 +43,24 @@ SSM と同様に、最初に Secrets Manager のシークレットに、`copilot
 
 | Field  | Value                                                                                                                                                                 |
 | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Name   | `demo/test/mysql`                                                                                                                                                     |
+| Name   | `mysql`                                                                                                                                                     |
 | ARN    | `arn:aws:secretsmanager:us-west-2:111122223333:secret:demo/test/mysql-Yi6mvL`                                                                                        |
 | Value  | `{"engine": "mysql","username": "user1","password": "i29wwX!%9wFV","host": "my-database-endpoint.us-east-1.rds.amazonaws.com","dbname": "myDatabase","port": "3306"`} |
 | Tags   | `copilot-application=demo`, `copilot-environment=test` |
 
 
-マニフェストを次の様に変更します。
+Manifest を次の様に変更します。
 ```yaml
 secrets:
   # (推奨) オプション 1. 名前を使ってシークレットを参照します。
   DB:
-    secretsmanager: 'demo/test/mysql'
+    secretsmanager: 'mysql'
   # JSON blob 内の特定のキーを参照できます。
   DB_PASSWORD:
-    secretsmanager: 'demo/test/mysql:password::'
-  # 事前に定義された環境変数を利用して、マニフェストを簡潔に保つ事ができます。
+    secretsmanager: 'mysql:password::'
+  # 事前に定義された環境変数を利用して、Manifest を簡潔に保つ事ができます。
   DB_PASSWORD:
-    secretsmanager: '${COPILOT_APPLICATION_NAME}/${COPILOT_ENVIRONMENT_NAME}/mysql:password::'
+    secretsmanager: 'mysql:password::'
 
   # オプション 2. 別の方法として、ARN によってシークレットを指定することができます。
   DB: "'arn:aws:secretsmanager:us-west-2:111122223333:secret:demo/test/mysql-Yi6mvL'"

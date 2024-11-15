@@ -2,6 +2,116 @@
 # SPDX-License-Identifier: Apache-2.0
 AWSTemplateFormatVersion: 2010-09-09
 Description: CloudFormation template that represents a worker service on Amazon ECS.
+Metadata:
+  Version: v1.29.0
+  Manifest: |
+    # The manifest for the "dog-worker" service.
+    # Read the full specification for the "Worker Service" type at:
+    # https://aws.github.io/copilot-cli/docs/manifest/worker-service/
+
+    # Your service name will be used in naming your resources like log groups, ECS services, etc.
+    name: dogworker
+    type: Worker Service
+
+    # Configuration for your containers and service.
+
+    cpu: 256       # Number of CPU units for the task.
+    memory: 512    # Amount of memory in MiB used by the task.
+    count:
+      range:
+        min: 1
+        max: 10
+        spot_from: 6
+      queue_delay:  # Should result in 900 msgs backlog.
+        acceptable_latency: 15m
+        msg_processing_time: 1s
+    exec: true     # Enable running commands in your container.
+
+    deployment:
+      rollback_alarms:
+        cpu_utilization: 70
+        memory_utilization: 50
+        messages_delayed: 5
+
+    publish:
+      topics:
+        - name: givesOtherdogs
+        - name: mytopic
+          fifo: true
+        - name: mytopic
+        - name: yourtopic
+          fifo:
+            content_based_deduplication: true
+        - name: nonfifotopic
+          fifo: false
+
+    subscribe:
+      queue:
+        delay: 1s
+        dead_letter:
+          tries: 5
+      topics:
+        - name: givesdogs
+          service: dogsvc
+          filter_policy:
+            store:
+              - example_corp
+            event:
+              - anything-but: order_cancelled
+            cutomer_interests:
+              - rugby
+              - football
+              - baseball
+            price_usd:
+              - numeric:
+                  - ">="
+                  - 100
+        - name: giveshuskies
+          service: dogsvc
+          queue:
+            timeout: 1s
+        - name: mytopic
+          service: mytopic
+          queue:
+            fifo: true
+        - name: yourtopic
+          service: yourtopic
+          queue:
+            fifo:
+              content_based_deduplication: true
+              high_throughput: true
+        - name: nonfifotopic
+          service: nonfifotopic
+          queue:
+            fifo: false
+    storage:
+      volumes:
+        externalEFSVolume:
+          path: '/etc/mount1'
+          efs:
+            id:
+              from_cfn: stack-fs-12345
+        externalEFSVolume2:
+          path: '/etc/mount2'
+          efs:
+            id:
+              from_cfn: stack-fs-12345
+
+    # Optional fields for more advanced use-cases.
+    #
+    #variables:                    # Pass environment variables as key value pairs.
+    #  LOG_LEVEL: info
+
+    #secrets:                      # Pass secrets from AWS Systems Manager (SSM) Parameter Store.
+    #  GITHUB_TOKEN: GITHUB_TOKEN  # The key is the name of the environment variable, the value is the name of the SSM parameter.
+
+    # You can override any of the values defined above by environment.
+    environments:
+      test:
+        image:
+          location: amazon/ecs-example
+        network:
+          connect: true
 Parameters:
   AppName:
     Type: String
@@ -25,10 +135,14 @@ Parameters:
     Description: 'URL of the environment file.'
     Type: String
     Default: ""
+  ArtifactKeyARN:
+    Type: String
+    Description: 'KMS Key used for encrypting artifacts'
   LogRetention:
     Type: Number
     Default: 30
 Conditions:
+  IsGovCloud: !Equals [!Ref "AWS::Partition", "aws-us-gov"]
   HasAddons: !Not [!Equals [!Ref AddonsTemplateURL, ""]]
   HasEnvFile:
     !Not [!Equals [!Ref EnvFileARN, ""]]
@@ -70,13 +184,18 @@ Resources:
             - Name: COPILOT_SERVICE_NAME
               Value: !Sub '${WorkloadName}'
             - Name: COPILOT_SNS_TOPIC_ARNS
-              Value: '{"givesOtherdogs":"arn:aws:sns:us-west-2:123456789123:my-app-test-dogworker-givesOtherdogs"}'
+              Value: '{"givesOtherdogs":"arn:aws:sns:us-west-2:123456789123:my-app-test-dogworker-givesOtherdogs","mytopic":"arn:aws:sns:us-west-2:123456789123:my-app-test-dogworker-mytopic","mytopic.fifo":"arn:aws:sns:us-west-2:123456789123:my-app-test-dogworker-mytopic.fifo","nonfifotopic":"arn:aws:sns:us-west-2:123456789123:my-app-test-dogworker-nonfifotopic","yourtopic.fifo":"arn:aws:sns:us-west-2:123456789123:my-app-test-dogworker-yourtopic.fifo"}'
             - Name: COPILOT_QUEUE_URI
               Value: !Ref EventsQueue
             - Name: COPILOT_TOPIC_QUEUE_URIS
               Value: !Sub
-                - '{"dogsvcGiveshuskiesEventsQueue":"${dogsvcgiveshuskiesURL}"}'
+                - '{"dogsvcGiveshuskiesEventsQueue":"${dogsvcgiveshuskiesURL}","mytopicMytopicfifoEventsQueue":"${mytopicmytopicfifoURL}","nonfifotopicNonfifotopicEventsQueue":"${nonfifotopicnonfifotopicURL}","yourtopicYourtopicfifoEventsQueue":"${yourtopicyourtopicfifoURL}"}'
                 - dogsvcgiveshuskiesURL: !Ref dogsvcgiveshuskiesEventsQueue
+                  mytopicmytopicfifoURL: !Ref mytopicmytopicfifoEventsQueue
+                  yourtopicyourtopicfifoURL: !Ref yourtopicyourtopicfifoEventsQueue
+                  nonfifotopicnonfifotopicURL: !Ref nonfifotopicnonfifotopicEventsQueue
+            - Name: COPILOT_MOUNT_POINTS
+              Value: '{"externalEFSVolume":"/etc/mount1","externalEFSVolume2":"/etc/mount2"}'
           EnvironmentFiles:
           - !If
             - HasEnvFile
@@ -89,12 +208,35 @@ Resources:
               awslogs-region: !Ref AWS::Region
               awslogs-group: !Ref LogGroup
               awslogs-stream-prefix: copilot
+          MountPoints:
+            - ContainerPath: '/etc/mount1'
+              ReadOnly: true
+              SourceVolume: externalEFSVolume
+            - ContainerPath: '/etc/mount2'
+              ReadOnly: true
+              SourceVolume: externalEFSVolume2
+      Volumes:
+        - Name: externalEFSVolume
+          EFSVolumeConfiguration:
+            FilesystemId: !ImportValue 'stack-fs-12345'
+            RootDirectory: '/'
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              IAM: DISABLED
+        - Name: externalEFSVolume2
+          EFSVolumeConfiguration:
+            FilesystemId: !ImportValue 'stack-fs-12345'
+            RootDirectory: '/'
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              IAM: DISABLED
   ExecutionRole:
     Metadata:
       'aws:copilot:description': 'An IAM Role for the Fargate agent to make AWS API calls on your behalf'
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -127,7 +269,17 @@ Resources:
                 Action:
                   - 'kms:Decrypt'
                 Resource:
+                  - !Ref ArtifactKeyARN
+              - Sid: DecryptTaggedKMSKey
+                Effect: 'Allow'
+                Action:
+                  - 'kms:Decrypt'
+                Resource:
                   - !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/copilot-application': !Sub '${AppName}'
+                    'aws:ResourceTag/copilot-environment': !Sub '${EnvName}'
         - !If
           - HasEnvFile
           - PolicyName: !Join ['', [!Ref AppName, '-', !Ref EnvName, '-', !Ref WorkloadName, GetEnvFilePolicy]]
@@ -158,27 +310,20 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
               Service: ecs-tasks.amazonaws.com
             Action: 'sts:AssumeRole'
       Policies:
-        - PolicyName: 'DenyIAMExceptTaggedRoles'
+        - PolicyName: 'DenyIAM'
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: 'Deny'
                 Action: 'iam:*'
                 Resource: '*'
-              - Effect: 'Allow'
-                Action: 'sts:AssumeRole'
-                Resource:
-                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
-                Condition:
-                  StringEquals:
-                    'iam:ResourceTag/copilot-application': !Sub '${AppName}'
-                    'iam:ResourceTag/copilot-environment': !Sub '${EnvName}'
         - PolicyName: 'ExecuteCommand'
           PolicyDocument:
             Version: '2012-10-17'
@@ -189,6 +334,24 @@ Resources:
               - Effect: 'Allow'
                 Action: ["logs:CreateLogStream", "logs:DescribeLogGroups", "logs:DescribeLogStreams", "logs:PutLogEvents"]
                 Resource: "*"
+        - PolicyName: !Join ['', ['GrantEFSAccess', !ImportValue 'stack-fs-12345', '-0']]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'elasticfilesystem:ClientMount'
+                Resource:
+                  - !Join ['/', [!Sub 'arn:${AWS::Partition}:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system', !ImportValue 'stack-fs-12345']]
+        - PolicyName: !Join ['', ['GrantEFSAccess', !ImportValue 'stack-fs-12345', '-1']]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'elasticfilesystem:ClientMount'
+                Resource:
+                  - !Join ['/', [!Sub 'arn:${AWS::Partition}:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system', !ImportValue 'stack-fs-12345']]
         - PolicyName: 'Publish2SNS'
           PolicyDocument:
             Version: '2012-10-17'
@@ -197,7 +360,13 @@ Resources:
                 Action: 'sns:Publish'
                 Resource:
                   - !Ref givesOtherdogsSNSTopic
+                  - !Ref mytopicfifoSNSTopic
+                  - !Ref mytopicSNSTopic
+                  - !Ref yourtopicfifoSNSTopic
+                  - !Ref nonfifotopicSNSTopic
   DynamicDesiredCountAction:
+    Metadata:
+      'aws:copilot:description': "A custom resource returning the ECS service's running task count"
     Type: Custom::DynamicDesiredCountFunction
     Properties:
       ServiceToken: !GetAtt DynamicDesiredCountFunction.Arn
@@ -212,18 +381,62 @@ Resources:
   DynamicDesiredCountFunction:
     Type: AWS::Lambda::Function
     Properties:
-      Code:
-        ZipFile: |
-          mockDynamicDesiredCountZipFile
       Handler: "index.handler"
       Timeout: 600
       MemorySize: 512
-      Role: !GetAtt 'CustomResourceRole.Arn'
-      Runtime: nodejs12.x
-  AutoScalingRole:
+      Role: !GetAtt 'DynamicDesiredCountFunctionRole.Arn'
+      Runtime: nodejs20.x
+  DynamicDesiredCountFunctionRole:
+    Metadata:
+      'aws:copilot:description': "An IAM Role for describing number of running tasks in your ECS service"
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: "DelegateDesiredCountAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ECS
+                Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    'ecs:cluster':
+                      Fn::Sub:
+                        - arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}
+                        - ClusterName:
+                            Fn::ImportValue: !Sub '${AppName}-${EnvName}-ClusterId'
+              - Sid: ResourceGroups
+                Effect: Allow
+                Action:
+                  - resource-groups:GetResources
+                Resource: "*"
+              - Sid: Tags
+                Effect: Allow
+                Action:
+                  - "tag:GetResources"
+                Resource: "*"
+  AutoScalingRole:
+    Metadata:
+      'aws:copilot:description': 'An IAM role for container auto scaling'
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -262,14 +475,11 @@ Resources:
       'aws:copilot:description': "A Lambda function to emit BacklogPerTask metrics to CloudWatch"
     Type: AWS::Lambda::Function
     Properties:
-      Code:
-        ZipFile: |
-          mockBacklogPerTaskLambda
       Handler: "index.handler"
       Timeout: 600
       MemorySize: 512
       Role: !GetAtt BacklogPerTaskCalculatorRole.Arn
-      Runtime: nodejs12.x
+      Runtime: nodejs20.x
       Environment:
         Variables:
           CLUSTER_NAME:
@@ -281,11 +491,16 @@ Resources:
               - ','
               - - !GetAtt EventsQueue.QueueName
                 - !GetAtt dogsvcgiveshuskiesEventsQueue.QueueName
+                - !GetAtt mytopicmytopicfifoEventsQueue.QueueName
+                - !GetAtt yourtopicyourtopicfifoEventsQueue.QueueName
+                - !GetAtt nonfifotopicnonfifotopicEventsQueue.QueueName
   BacklogPerTaskCalculatorRole:
+    Metadata:
+      'aws:copilot:description': 'An IAM role for BacklogPerTaskCalculatorFunction'
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -319,6 +534,9 @@ Resources:
                 Resource:
                   - !GetAtt EventsQueue.Arn
                   - !GetAtt dogsvcgiveshuskiesEventsQueue.Arn
+                  - !GetAtt mytopicmytopicfifoEventsQueue.Arn
+                  - !GetAtt yourtopicyourtopicfifoEventsQueue.Arn
+                  - !GetAtt nonfifotopicnonfifotopicEventsQueue.Arn
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
   BacklogPerTaskScheduledRule:
@@ -380,48 +598,66 @@ Resources:
               Value: !GetAtt dogsvcgiveshuskiesEventsQueue.QueueName
           Unit: Count
         TargetValue: 900
-  CustomResourceRole:
-    Type: AWS::IAM::Role
+  AutoScalingPolicymytopicmytopicfifoEventsQueue:
+    Metadata:
+      'aws:copilot:description': "An autoscaling policy to maintain 900 messages/task for mytopicmytopicfifoEventsQueue"
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
     Properties:
-      AssumeRolePolicyDocument:
-        Version: 2012-10-17
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      Path: /
-      Policies:
-        - PolicyName: "DelegateDesiredCountAccess"
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: ECS
-                Effect: Allow
-                Action:
-                  - ecs:DescribeServices
-                Resource: "*"
-                Condition:
-                  ArnEquals:
-                    'ecs:cluster':
-                      Fn::Sub:
-                        - arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}
-                        - ClusterName:
-                            Fn::ImportValue: !Sub '${AppName}-${EnvName}-ClusterId'
-              - Sid: ResourceGroups
-                Effect: Allow
-                Action:
-                  - resource-groups:GetResources
-                Resource: "*"
-              - Sid: Tags
-                Effect: Allow
-                Action:
-                  - "tag:GetResources"
-                Resource: "*"
-      ManagedPolicyArns:
-        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      PolicyName: !Join [ '-', [ !Ref WorkloadName, BacklogPerTask, !GetAtt mytopicmytopicfifoEventsQueue.QueueName ] ]
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 60
+        CustomizedMetricSpecification:
+          Namespace: !Sub '${AppName}-${EnvName}-${WorkloadName}'
+          MetricName: BacklogPerTask
+          Statistic: Average
+          Dimensions:
+            - Name: QueueName
+              Value: !GetAtt mytopicmytopicfifoEventsQueue.QueueName
+          Unit: Count
+        TargetValue: 900
+  AutoScalingPolicyyourtopicyourtopicfifoEventsQueue:
+    Metadata:
+      'aws:copilot:description': "An autoscaling policy to maintain 900 messages/task for yourtopicyourtopicfifoEventsQueue"
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Join [ '-', [ !Ref WorkloadName, BacklogPerTask, !GetAtt yourtopicyourtopicfifoEventsQueue.QueueName ] ]
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 60
+        CustomizedMetricSpecification:
+          Namespace: !Sub '${AppName}-${EnvName}-${WorkloadName}'
+          MetricName: BacklogPerTask
+          Statistic: Average
+          Dimensions:
+            - Name: QueueName
+              Value: !GetAtt yourtopicyourtopicfifoEventsQueue.QueueName
+          Unit: Count
+        TargetValue: 900
+  AutoScalingPolicynonfifotopicnonfifotopicEventsQueue:
+    Metadata:
+      'aws:copilot:description': "An autoscaling policy to maintain 900 messages/task for nonfifotopicnonfifotopicEventsQueue"
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Join [ '-', [ !Ref WorkloadName, BacklogPerTask, !GetAtt nonfifotopicnonfifotopicEventsQueue.QueueName ] ]
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 60
+        CustomizedMetricSpecification:
+          Namespace: !Sub '${AppName}-${EnvName}-${WorkloadName}'
+          MetricName: BacklogPerTask
+          Statistic: Average
+          Dimensions:
+            - Name: QueueName
+              Value: !GetAtt nonfifotopicnonfifotopicEventsQueue.QueueName
+          Unit: Count
+        TargetValue: 900
   Service:
     DependsOn:
       - EnvControllerAction
@@ -439,6 +675,13 @@ Resources:
           Rollback: true
         MinimumHealthyPercent: 100
         MaximumPercent: 200
+        Alarms:
+          AlarmNames:
+            - my-app-test-dogworker-CopilotRollbackCPUAlarm
+            - my-app-test-dogworker-CopilotRollbackMemAlarm
+            - my-app-test-dogworker-CopilotRollbackMsgsDelayedAlarm
+          Enable: true
+          Rollback: true
       PlatformVersion: LATEST
       PropagateTags: SERVICE
       EnableExecuteCommand: true
@@ -448,6 +691,15 @@ Resources:
         - CapacityProvider: FARGATE
           Weight: 0
           Base: 5
+      ServiceConnectConfiguration:
+        Enabled: True
+        Namespace: test.my-app.local
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-region: !Ref AWS::Region
+            awslogs-group: !Ref LogGroup
+            awslogs-stream-prefix: copilot
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
@@ -539,7 +791,7 @@ Resources:
     Properties:
       Queues: [!Ref 'DeadLetterQueue']
       PolicyDocument:
-        Version: "2012-10-17"
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -621,6 +873,125 @@ Resources:
             Condition:
               ArnEquals:
                 aws:SourceArn: !Join ['', [!Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:', !Ref AppName, '-', !Ref EnvName, '-dogsvc-giveshuskies']]
+  mytopicmytopicfifoSNSTopicSubscription:
+    Metadata:
+      'aws:copilot:description': 'A SNS subscription to topic mytopic.fifo from service mytopic'
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Join [ '', [ !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:', !Ref AppName, '-', !Ref EnvName, '-mytopic-mytopic.fifo' ] ]
+      Protocol: 'sqs'
+      Endpoint: !GetAtt mytopicmytopicfifoEventsQueue.Arn
+  mytopicmytopicfifoEventsQueue:
+    Metadata:
+      'aws:copilot:description': 'A SQS FIFO queue to buffer messages from the topic mytopic.fifo'
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref EventsKMSKey
+      FifoQueue: true
+  mytopicmytopicfifoQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [ !Ref 'mytopicmytopicfifoEventsQueue' ]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt TaskRole.Arn
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+            Resource: !GetAtt mytopicmytopicfifoEventsQueue.Arn
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt mytopicmytopicfifoEventsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Join [ '', [ !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:', !Ref AppName, '-', !Ref EnvName, '-mytopic-mytopic.fifo' ] ]
+  yourtopicyourtopicfifoSNSTopicSubscription:
+    Metadata:
+      'aws:copilot:description': 'A SNS subscription to topic yourtopic.fifo from service yourtopic'
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Join [ '', [ !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:', !Ref AppName, '-', !Ref EnvName, '-yourtopic-yourtopic.fifo' ] ]
+      Protocol: 'sqs'
+      Endpoint: !GetAtt yourtopicyourtopicfifoEventsQueue.Arn
+  yourtopicyourtopicfifoEventsQueue:
+    Metadata:
+      'aws:copilot:description': 'A SQS FIFO queue to buffer messages from the topic yourtopic.fifo'
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref EventsKMSKey
+      FifoQueue: true
+      FifoThroughputLimit: perMessageGroupId
+      DeduplicationScope: messageGroup
+      ContentBasedDeduplication: true
+  yourtopicyourtopicfifoQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [ !Ref 'yourtopicyourtopicfifoEventsQueue' ]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt TaskRole.Arn
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+            Resource: !GetAtt yourtopicyourtopicfifoEventsQueue.Arn
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt yourtopicyourtopicfifoEventsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Join [ '', [ !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:', !Ref AppName, '-', !Ref EnvName, '-yourtopic-yourtopic.fifo' ] ]
+  nonfifotopicnonfifotopicSNSTopicSubscription:
+    Metadata:
+      'aws:copilot:description': 'A SNS subscription to topic nonfifotopic from service nonfifotopic'
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Join [ '', [ !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:', !Ref AppName, '-', !Ref EnvName, '-nonfifotopic-nonfifotopic' ] ]
+      Protocol: 'sqs'
+      Endpoint: !GetAtt nonfifotopicnonfifotopicEventsQueue.Arn
+  nonfifotopicnonfifotopicEventsQueue:
+    Metadata:
+      'aws:copilot:description': 'A SQS queue to buffer messages from the topic nonfifotopic'
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref EventsKMSKey
+  nonfifotopicnonfifotopicQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [ !Ref 'nonfifotopicnonfifotopicEventsQueue' ]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt TaskRole.Arn
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+            Resource: !GetAtt nonfifotopicnonfifotopicEventsQueue.Arn
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt nonfifotopicnonfifotopicEventsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Join [ '', [ !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:', !Ref AppName, '-', !Ref EnvName, '-nonfifotopic-nonfifotopic' ] ]
   givesOtherdogsSNSTopic:
     Metadata:
       'aws:copilot:description': 'A SNS topic to broadcast givesOtherdogs events'
@@ -646,11 +1017,113 @@ Resources:
             Condition:
               StringEquals:
                 "sns:Protocol": "sqs"
+  mytopicfifoSNSTopic:
+    Metadata:
+      'aws:copilot:description': 'A SNS FIFO topic to broadcast mytopic.fifo events'
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-mytopic.fifo'
+      FifoTopic: true
+      KmsMasterKeyId: 'alias/aws/sns'
+  mytopicfifoSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    DependsOn: mytopicfifoSNSTopic
+    Properties:
+      Topics:
+        - !Ref mytopicfifoSNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - sns:Subscribe
+            Resource: !Ref mytopicfifoSNSTopic
+            Condition:
+              StringEquals:
+                "sns:Protocol": "sqs"
+  mytopicSNSTopic:
+    Metadata:
+      'aws:copilot:description': 'A SNS topic to broadcast mytopic events'
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-mytopic'
+      KmsMasterKeyId: 'alias/aws/sns'
+  mytopicSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    DependsOn: mytopicSNSTopic
+    Properties:
+      Topics:
+        - !Ref mytopicSNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - sns:Subscribe
+            Resource: !Ref mytopicSNSTopic
+            Condition:
+              StringEquals:
+                "sns:Protocol": "sqs"
+  yourtopicfifoSNSTopic:
+    Metadata:
+      'aws:copilot:description': 'A SNS FIFO topic to broadcast yourtopic.fifo events'
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-yourtopic.fifo'
+      FifoTopic: true
+      ContentBasedDeduplication: true
+      KmsMasterKeyId: 'alias/aws/sns'
+  yourtopicfifoSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    DependsOn: yourtopicfifoSNSTopic
+    Properties:
+      Topics:
+        - !Ref yourtopicfifoSNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - sns:Subscribe
+            Resource: !Ref yourtopicfifoSNSTopic
+            Condition:
+              StringEquals:
+                "sns:Protocol": "sqs"
+  nonfifotopicSNSTopic:
+    Metadata:
+      'aws:copilot:description': 'A SNS topic to broadcast nonfifotopic events'
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-nonfifotopic'
+      KmsMasterKeyId: 'alias/aws/sns'
+  nonfifotopicSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    DependsOn: nonfifotopicSNSTopic
+    Properties:
+      Topics:
+        - !Ref nonfifotopicSNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - sns:Subscribe
+            Resource: !Ref nonfifotopicSNSTopic
+            Condition:
+              StringEquals:
+                "sns:Protocol": "sqs"
   AddonsStack:
     Metadata:
       'aws:copilot:description': 'An Addons CloudFormation Stack for your additional AWS resources'
-    Type: AWS::CloudFormation::Stack # Needed for #1848
-    DependsOn: EnvControllerAction
+    Type: AWS::CloudFormation::Stack
     Condition: HasAddons
     Properties:
       Parameters:
@@ -658,6 +1131,69 @@ Resources:
         Env: !Ref EnvName
         Name: !Ref WorkloadName
       TemplateURL: !Ref AddonsTemplateURL
+  CPURollbackAlarm:
+    Metadata:
+      'aws:copilot:description': "A CloudWatch alarm associated with CPU utilization for deployment rollbacks"
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Roll back ECS service if CPU utilization is greater than or equal to 70% twice in 3 minutes."
+      AlarmName: my-app-test-dogworker-CopilotRollbackCPUAlarm
+      Namespace: 'AWS/ECS'
+      Dimensions:
+        - Name: ClusterName
+          Value:
+            Fn::ImportValue: !Sub '${AppName}-${EnvName}-ClusterId'
+        - Name: ServiceName
+          Value: !Select [ 2, !Split [ "/", !Ref Service ] ]
+      MetricName: 'CPUUtilization'
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      DatapointsToAlarm: 2
+      EvaluationPeriods: 3
+      Period: 60
+      Statistic: 'Average'
+      Threshold: 70
+      Unit: 'Percent'
+  MemoryRollbackAlarm:
+    Metadata:
+      'aws:copilot:description': "A CloudWatch alarm associated with memory utilization for deployment rollbacks"
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Roll back ECS service if memory utilization is greater than or equal to 50% twice in 3 minutes."
+      AlarmName: my-app-test-dogworker-CopilotRollbackMemAlarm
+      Namespace: 'AWS/ECS'
+      Dimensions:
+        - Name: ClusterName
+          Value:
+            Fn::ImportValue: !Sub '${AppName}-${EnvName}-ClusterId'
+        - Name: ServiceName
+          Value: !Select [ 2, !Split [ "/", !Ref Service ] ]
+      MetricName: 'MemoryUtilization'
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      DatapointsToAlarm: 2
+      EvaluationPeriods: 3
+      Period: 60
+      Statistic: 'Average'
+      Threshold: 50
+      Unit: 'Percent'
+  MessagesDelayedRollbackAlarm:
+    Metadata:
+      'aws:copilot:description': "A CloudWatch alarm associated with number of messages delayed for deployment rollbacks"
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Roll back worker service if number of messages delayed is greater than or equal to 5 twice in 3 minutes."
+      AlarmName: my-app-test-dogworker-CopilotRollbackMsgsDelayedAlarm
+      Namespace: 'AWS/SQS'
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventsQueue.QueueName
+      MetricName: 'ApproximateNumberOfMessagesDelayed'
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      DatapointsToAlarm: 2
+      EvaluationPeriods: 3
+      Period: 60
+      Statistic: 'Average'
+      Threshold: 5
+      Unit: 'Count'
   EnvControllerAction:
     Metadata:
       'aws:copilot:description': "Update your environment's shared resources"
@@ -667,22 +1203,22 @@ Resources:
       Workload: !Ref WorkloadName
       EnvStack: !Sub '${AppName}-${EnvName}'
       Parameters: []
+      EnvVersion: v1.42.0
   EnvControllerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      Code:
-        ZipFile: |
-          mockEnvControllerZipFile
       Handler: "index.handler"
       Timeout: 900
       MemorySize: 512
       Role: !GetAtt 'EnvControllerRole.Arn'
-      Runtime: nodejs12.x
+      Runtime: nodejs20.x
   EnvControllerRole:
+    Metadata:
+      'aws:copilot:description': "An IAM role to update your environment stack"
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:

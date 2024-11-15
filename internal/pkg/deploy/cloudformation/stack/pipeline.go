@@ -10,13 +10,9 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 )
 
-const (
-	pipelineCfnTemplatePath = "cicd/pipeline_cfn.yml"
-)
-
 type pipelineStackConfig struct {
 	*deploy.CreatePipelineInput
-	parser template.Parser
+	parser pipelineParser
 }
 
 // NewPipelineStackConfig sets up a struct which can provide values to CloudFormation for
@@ -30,29 +26,20 @@ func NewPipelineStackConfig(in *deploy.CreatePipelineInput) *pipelineStackConfig
 
 // StackName returns the name of the CloudFormation stack.
 func (p *pipelineStackConfig) StackName() string {
-	return p.Name
+	return NameForPipeline(p.AppName, p.Name, p.IsLegacy)
 }
 
 // Template returns the CloudFormation template for the service parametrized for the environment.
 func (p *pipelineStackConfig) Template() (string, error) {
-	content, err := p.parser.Parse(pipelineCfnTemplatePath, p, template.WithFuncs(cfTemplateFunctions), template.WithFuncs(map[string]interface{}{
-		"isCodeStarConnection": func(source interface{}) bool {
-			type connectionName interface {
-				ConnectionName() (string, error)
-			}
-			_, ok := source.(connectionName)
-			return ok
-		},
-	}))
+	content, err := p.parser.ParsePipeline(p)
 	if err != nil {
 		return "", err
 	}
 	return content.String(), nil
 }
 
-// SerializedParameters returns the CloudFormation stack's parameters serialized
-// to a YAML document annotated with comments for readability to users.
-func (s *pipelineStackConfig) SerializedParameters() (string, error) {
+// SerializedParameters returns the CloudFormation stack's parameters serialized to a JSON document.
+func (p *pipelineStackConfig) SerializedParameters() (string, error) {
 	// No-op for now.
 	return "", nil
 }
@@ -64,7 +51,11 @@ func (p *pipelineStackConfig) Parameters() ([]*cloudformation.Parameter, error) 
 
 // Tags returns the tags that should be applied to the pipeline CloudFormation stack.
 func (p *pipelineStackConfig) Tags() []*cloudformation.Tag {
-	return mergeAndFlattenTags(p.AdditionalTags, map[string]string{
+	defaultTags := map[string]string{
 		deploy.AppTagKey: p.AppName,
-	})
+	}
+	if !p.IsLegacy {
+		defaultTags[deploy.PipelineTagKey] = p.Name
+	}
+	return mergeAndFlattenTags(p.AdditionalTags, defaultTags)
 }

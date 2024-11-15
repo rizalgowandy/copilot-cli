@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 "use strict";
 
-const aws = require("aws-sdk");
+const { fromEnv, fromTemporaryCredentials } = require("@aws-sdk/credential-providers");
+const { Route53, waitUntilResourceRecordSetsChanged, ListHostedZonesByNameCommand, ChangeResourceRecordSetsCommand} = require("@aws-sdk/client-route-53");
+
+const changeRecordAction = {
+  Upsert: "UPSERT",
+  Delete: "DELETE",
+}
 
 // These are used for test purposes only
 let defaultResponseURL;
 let defaultLogGroup;
 let defaultLogStream;
-let waiter;
 
 let hostedZoneCache = new Map();
 
@@ -81,8 +86,8 @@ let report = function (
  * it is corresponding hosted zone is not managable by Copilot.
  *
  * @param {string} aliases the custom domain aliases
- * @param {string} lbDNS DNS of the load balancer
- * @param {string} lbHostedZone Hosted Zone of the load balancer
+ * @param {string} accessDNS DNS of the public access
+ * @param {string} accessHostedZone Hosted Zone of the public access
  * @param {string} rootDnsRole the IAM role ARN that can manage domainName
  * @param {string} aliasTypes the alias type
  */
@@ -90,66 +95,67 @@ const writeCustomDomainRecord = async function (
   appRoute53,
   envRoute53,
   aliases,
-  lbDNS,
-  lbHostedZone,
+  accessDNS,
+  accessHostedZone,
   aliasTypes,
   action
 ) {
+  const actions = [];
   for (const alias of aliases) {
     const aliasType = await getAliasType(aliasTypes, alias);
     switch (aliasType) {
       case aliasTypes.EnvDomainZone:
-        await writeARecord(
+        actions.push(writeARecord(
           envRoute53,
           alias,
-          lbDNS,
-          lbHostedZone,
+          accessDNS,
+          accessHostedZone,
           aliasType.domain,
           action
-        );
+        ));
         break;
       case aliasTypes.AppDomainZone:
-        await writeARecord(
+        actions.push(writeARecord(
           appRoute53,
           alias,
-          lbDNS,
-          lbHostedZone,
+          accessDNS,
+          accessHostedZone,
           aliasType.domain,
           action
-        );
+        ));
         break;
       case aliasTypes.RootDomainZone:
-        await writeARecord(
+        actions.push(writeARecord(
           appRoute53,
           alias,
-          lbDNS,
-          lbHostedZone,
+          accessDNS,
+          accessHostedZone,
           aliasType.domain,
           action
-        );
+        ));
         break;
       // We'll skip if it is the other alias type since it will be in another account's route53.
       default:
     }
   }
+  await Promise.all(actions);
 };
 
 const writeARecord = async function (
   route53,
   alias,
-  lbDNS,
-  lbHostedZone,
+  accessDNS,
+  accessHostedZone,
   domain,
   action
 ) {
   let hostedZoneId = hostedZoneCache.get(domain);
   if (!hostedZoneId) {
     const hostedZones = await route53
-      .listHostedZonesByName({
+    .send(new ListHostedZonesByNameCommand({
         DNSName: domain,
         MaxItems: "1",
-      })
-      .promise();
+      }));
 
     if (!hostedZones.HostedZones || hostedZones.HostedZones.length == 0) {
       throw new Error(`Couldn't find any Hosted Zone with DNS name ${domain}.`);
@@ -158,16 +164,27 @@ const writeARecord = async function (
     hostedZoneCache.set(domain, hostedZoneId);
   }
   console.log(`${action} A record into Hosted Zone ${hostedZoneId}`);
-  const changeBatch = await updateRecords(
-    route53,
-    hostedZoneId,
-    action,
-    alias,
-    lbDNS,
-    lbHostedZone
-  );
-  await waitForRecordChange(route53, changeBatch.ChangeInfo.Id);
+  try {
+    const changeBatch = await updateRecords(
+      route53,
+      hostedZoneId,
+      action,
+      alias,
+      accessDNS,
+      accessHostedZone
+    );
+    await exports.waitForRecordChange(route53, changeBatch.ChangeInfo.Id);
+  } catch (err) {
+    if (action === changeRecordAction.Delete && isRecordSetNotFoundErr(err)) {
+      console.log(`${err.message}; Copilot is ignoring this record.`);
+      return;
+    }
+    throw err;
+  }
 };
+
+// Example error message: "InvalidChangeBatch: [Tried to delete resource record set [name='a.domain.com.', type='A'] but it was not found]"
+const isRecordSetNotFoundErr = (err) => err.message.includes("Tried to delete resource record set") && err.message.includes("but it was not found")
 
 /**
  * Custom domain handler, invoked by Lambda.
@@ -192,17 +209,13 @@ exports.handler = async function (event, context) {
     },
     OtherDomainZone: { regex: new RegExp(`.*`) },
   };
-  const envRoute53 = new aws.Route53();
-  const appRoute53 = new aws.Route53({
-    credentials: new aws.ChainableTemporaryCredentials({
+  const envRoute53 = new Route53();
+  const appRoute53 = new Route53({
+    credentials: fromTemporaryCredentials({
       params: { RoleArn: props.AppDNSRole },
-      masterCredentials: new aws.EnvironmentCredentials("AWS"),
+      masterCredentials: fromEnv("AWS"),
     }),
   });
-  if (waiter) {
-    // Used by the test suite, since waiters aren't mockable yet
-    envRoute53.waitFor = appRoute53.waitFor = waiter;
-  }
   try {
     var aliases = await getAllAliases(props.Aliases);
     switch (event.RequestType) {
@@ -211,10 +224,10 @@ exports.handler = async function (event, context) {
           appRoute53,
           envRoute53,
           aliases,
-          props.LoadBalancerDNS,
-          props.LoadBalancerHostedZone,
+          props.PublicAccessDNS,
+          props.PublicAccessHostedZone,
           aliasTypes,
-          "UPSERT"
+          changeRecordAction.Upsert,
         );
         break;
       case "Update":
@@ -222,10 +235,10 @@ exports.handler = async function (event, context) {
           appRoute53,
           envRoute53,
           aliases,
-          props.LoadBalancerDNS,
-          props.LoadBalancerHostedZone,
+          props.PublicAccessDNS,
+          props.PublicAccessHostedZone,
           aliasTypes,
-          "UPSERT"
+          changeRecordAction.Upsert,
         );
         // After upserting new aliases, delete unused ones. For example: previously we have ["foo.com", "bar.com"],
         // and now the aliases param is updated to just ["foo.com"] then we'll delete "bar.com".
@@ -239,10 +252,10 @@ exports.handler = async function (event, context) {
           appRoute53,
           envRoute53,
           aliasesToDelete,
-          props.LoadBalancerDNS,
-          props.LoadBalancerHostedZone,
+          props.PublicAccessDNS,
+          props.PublicAccessHostedZone,
           aliasTypes,
-          "DELETE"
+          changeRecordAction.Delete,
         );
         break;
       case "Delete":
@@ -250,10 +263,10 @@ exports.handler = async function (event, context) {
           appRoute53,
           envRoute53,
           aliases,
-          props.LoadBalancerDNS,
-          props.LoadBalancerHostedZone,
+          props.PublicAccessDNS,
+          props.PublicAccessHostedZone,
           aliasTypes,
-          "DELETE"
+          changeRecordAction.Delete
         );
         break;
       default:
@@ -305,17 +318,16 @@ const getAliasType = function (aliasTypes, alias) {
   }
 };
 
-const waitForRecordChange = function (route53, changeId) {
-  return route53
-    .waitFor("resourceRecordSetsChanged", {
-      // Wait up to 5 minutes
-      $waiter: {
-        delay: 30,
-        maxAttempts: 10,
-      },
-      Id: changeId,
-    })
-    .promise();
+const waitForRecordChange = async function (route53, changeId) {
+  // wait Upto 5 minutes.
+  await waitUntilResourceRecordSetsChanged({
+    client: route53,
+    maxWaitTime: 300,
+    minDelay: 30,
+    maxDelay: 30,
+  },{
+    Id: changeId,
+  });
 };
 
 const updateRecords = function (
@@ -323,11 +335,11 @@ const updateRecords = function (
   hostedZone,
   action,
   alias,
-  lbDNS,
-  lbHostedZone
+  accessDNS,
+  accessHostedZone
 ) {
   return route53
-    .changeResourceRecordSets({
+    .send(new ChangeResourceRecordSetsCommand({
       ChangeBatch: {
         Changes: [
           {
@@ -336,8 +348,8 @@ const updateRecords = function (
               Name: alias,
               Type: "A",
               AliasTarget: {
-                HostedZoneId: lbHostedZone,
-                DNSName: lbDNS,
+                HostedZoneId: accessHostedZone,
+                DNSName: accessDNS,
                 EvaluateTargetHealth: true,
               },
             },
@@ -345,8 +357,8 @@ const updateRecords = function (
         ],
       },
       HostedZoneId: hostedZone,
-    })
-    .promise();
+    },
+  ));
 };
 
 /**
@@ -354,20 +366,6 @@ const updateRecords = function (
  */
 exports.withDefaultResponseURL = function (url) {
   defaultResponseURL = url;
-};
-
-/**
- * @private
- */
-exports.withWaiter = function (w) {
-  waiter = w;
-};
-
-/**
- * @private
- */
-exports.reset = function () {
-  waiter = undefined;
 };
 
 /**
@@ -382,4 +380,11 @@ exports.withDefaultLogStream = function (logStream) {
  */
 exports.withDefaultLogGroup = function (logGroup) {
   defaultLogGroup = logGroup;
+};
+
+/**
+ * @private
+ */
+exports.waitForRecordChange = function (route53, changeId) {
+  return waitForRecordChange(route53, changeId);
 };

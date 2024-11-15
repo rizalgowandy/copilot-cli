@@ -18,7 +18,7 @@ import (
 
 type showSvcMocks struct {
 	storeSvc  *mocks.Mockstore
-	describer *mocks.Mockdescriber
+	describer *mocks.MockworkloadDescriber
 	ws        *mocks.MockwsSvcReader
 	sel       *mocks.MockconfigSelector
 }
@@ -74,7 +74,7 @@ func TestSvcShow_Ask(t *testing.T) {
 		"error when fail to select apps": {
 			inputSvc: "my-svc",
 			setupMocks: func(m showSvcMocks) {
-				m.sel.EXPECT().Application(svcAppNamePrompt, svcAppNameHelpPrompt).Return("", errors.New("some error"))
+				m.sel.EXPECT().Application(svcAppNamePrompt, wkldAppNameHelpPrompt).Return("", errors.New("some error"))
 			},
 			wantedError: fmt.Errorf("select application name: some error"),
 		},
@@ -84,7 +84,7 @@ func TestSvcShow_Ask(t *testing.T) {
 				m.sel.EXPECT().Service(fmt.Sprintf(svcShowSvcNamePrompt, "my-app"), svcShowSvcNameHelpPrompt, "my-app").Return("my-svc", nil)
 				m.storeSvc.EXPECT().GetService("my-app", "my-svc").Times(0)
 				m.storeSvc.EXPECT().GetApplication("my-app").AnyTimes()
-				m.sel.EXPECT().Application(svcAppNamePrompt, svcAppNameHelpPrompt).AnyTimes()
+				m.sel.EXPECT().Application(svcAppNamePrompt, wkldAppNameHelpPrompt).AnyTimes()
 			},
 			wantedApp: "my-app",
 			wantedSvc: "my-svc",
@@ -92,7 +92,7 @@ func TestSvcShow_Ask(t *testing.T) {
 		"error when fail to select services": {
 			setupMocks: func(m showSvcMocks) {
 				gomock.InOrder(
-					m.sel.EXPECT().Application(svcAppNamePrompt, svcAppNameHelpPrompt).Return("my-app", nil),
+					m.sel.EXPECT().Application(svcAppNamePrompt, wkldAppNameHelpPrompt).Return("my-app", nil),
 					m.sel.EXPECT().Service(fmt.Sprintf(svcShowSvcNamePrompt, "my-app"), svcShowSvcNameHelpPrompt, "my-app").Return("", errors.New("some error")),
 				)
 			},
@@ -148,8 +148,9 @@ func TestSvcShow_Execute(t *testing.T) {
 		err:  errors.New("some error"),
 	}
 	testCases := map[string]struct {
-		inputSvc         string
-		shouldOutputJSON bool
+		inputSvc             string
+		shouldOutputJSON     bool
+		outputManifestForEnv string
 
 		setupMocks func(mocks showSvcMocks)
 
@@ -161,7 +162,7 @@ func TestSvcShow_Execute(t *testing.T) {
 				m.describer.EXPECT().Describe().Times(0)
 			},
 		},
-		"success": {
+		"print configuration by default": {
 			inputSvc: "my-svc",
 
 			setupMocks: func(m showSvcMocks) {
@@ -171,6 +172,15 @@ func TestSvcShow_Execute(t *testing.T) {
 			},
 
 			wantedContent: "mockData",
+		},
+		"print manifest file trimmed with spaces if --manifest is provided": {
+			inputSvc:             "my-svc",
+			outputManifestForEnv: "test",
+			setupMocks: func(m showSvcMocks) {
+				m.describer.EXPECT().Manifest(gomock.Any()).Return([]byte("name: my-svc\n\n\n  "), nil)
+			},
+
+			wantedContent: "name: my-svc\n",
 		},
 		"return error if fail to generate JSON output": {
 			inputSvc:         "my-svc",
@@ -195,6 +205,15 @@ func TestSvcShow_Execute(t *testing.T) {
 
 			wantedError: fmt.Errorf("describe service my-svc: some error"),
 		},
+		"return wrapped error if --manifest is provided and stack cannot be retrieved": {
+			inputSvc:             "my-svc",
+			outputManifestForEnv: "test",
+			setupMocks: func(m showSvcMocks) {
+				m.describer.EXPECT().Manifest(gomock.Any()).Return(nil, errors.New("some error"))
+			},
+
+			wantedError: errors.New(`fetch manifest for service "my-svc" in environment "test": some error`),
+		},
 	}
 
 	for name, tc := range testCases {
@@ -203,7 +222,7 @@ func TestSvcShow_Execute(t *testing.T) {
 			defer ctrl.Finish()
 
 			b := &bytes.Buffer{}
-			mockSvcDescriber := mocks.NewMockdescriber(ctrl)
+			mockSvcDescriber := mocks.NewMockworkloadDescriber(ctrl)
 
 			mocks := showSvcMocks{
 				describer: mockSvcDescriber,
@@ -213,9 +232,10 @@ func TestSvcShow_Execute(t *testing.T) {
 
 			showSvcs := &showSvcOpts{
 				showSvcVars: showSvcVars{
-					svcName:          tc.inputSvc,
-					shouldOutputJSON: tc.shouldOutputJSON,
-					appName:          appName,
+					appName:              appName,
+					svcName:              tc.inputSvc,
+					shouldOutputJSON:     tc.shouldOutputJSON,
+					outputManifestForEnv: tc.outputManifestForEnv,
 				},
 				describer:     mockSvcDescriber,
 				initDescriber: func() error { return nil },

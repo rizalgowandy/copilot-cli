@@ -11,11 +11,11 @@ import (
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/describe"
-	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/term/log"
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
 	"github.com/aws/copilot-cli/internal/pkg/term/selector"
@@ -66,7 +66,8 @@ func newSvcStatusOpts(vars svcStatusVars) (*svcStatusOpts, error) {
 			if err != nil {
 				return fmt.Errorf("retrieve %s from application %s: %w", o.appName, o.svcName, err)
 			}
-			if wkld.Type == manifest.RequestDrivenWebServiceType {
+			switch wkld.Type {
+			case manifestinfo.RequestDrivenWebServiceType:
 				d, err := describe.NewAppRunnerStatusDescriber(&describe.NewServiceStatusConfig{
 					App:         o.appName,
 					Env:         o.envName,
@@ -74,10 +75,21 @@ func newSvcStatusOpts(vars svcStatusVars) (*svcStatusOpts, error) {
 					ConfigStore: configStore,
 				})
 				if err != nil {
-					return fmt.Errorf("creating status describer for apprunner service %s in application %s: %w", o.svcName, o.appName, err)
+					return fmt.Errorf("create status describer for App Runner service %s in application %s: %w", o.svcName, o.appName, err)
 				}
 				o.statusDescriber = d
-			} else {
+			case manifestinfo.StaticSiteType:
+				d, err := describe.NewStaticSiteStatusDescriber(&describe.NewServiceStatusConfig{
+					App:         o.appName,
+					Env:         o.envName,
+					Svc:         o.svcName,
+					ConfigStore: configStore,
+				})
+				if err != nil {
+					return fmt.Errorf("create status describer for Static Site service %s in application %s: %w", o.svcName, o.appName, err)
+				}
+				o.statusDescriber = d
+			default:
 				d, err := describe.NewECSStatusDescriber(&describe.NewServiceStatusConfig{
 					App:         o.appName,
 					Env:         o.envName,
@@ -85,7 +97,7 @@ func newSvcStatusOpts(vars svcStatusVars) (*svcStatusOpts, error) {
 					ConfigStore: configStore,
 				})
 				if err != nil {
-					return fmt.Errorf("creating status describer for service %s in application %s: %w", o.svcName, o.appName, err)
+					return fmt.Errorf("create status describer for service %s in application %s: %w", o.svcName, o.appName, err)
 				}
 				o.statusDescriber = d
 			}
@@ -135,7 +147,7 @@ func (o *svcStatusOpts) validateOrAskApp() error {
 		_, err := o.store.GetApplication(o.appName)
 		return err
 	}
-	app, err := o.sel.Application(svcAppNamePrompt, svcAppNameHelpPrompt)
+	app, err := o.sel.Application(svcAppNamePrompt, wkldAppNameHelpPrompt)
 	if err != nil {
 		return fmt.Errorf("select application: %w", err)
 	}
@@ -157,11 +169,11 @@ func (o *svcStatusOpts) validateAndAskSvcEnvName() error {
 	}
 	// Note: we let prompter handle the case when there is only option for user to choose from.
 	// This is naturally the case when `o.envName != "" && o.svcName != ""`.
-	deployedService, err := o.sel.DeployedService(svcStatusNamePrompt, svcStatusNameHelpPrompt, o.appName, selector.WithEnv(o.envName), selector.WithSvc(o.svcName))
+	deployedService, err := o.sel.DeployedService(svcStatusNamePrompt, svcStatusNameHelpPrompt, o.appName, selector.WithEnv(o.envName), selector.WithName(o.svcName))
 	if err != nil {
 		return fmt.Errorf("select deployed services for application %s: %w", o.appName, err)
 	}
-	o.svcName = deployedService.Svc
+	o.svcName = deployedService.Name
 	o.envName = deployedService.Env
 	return nil
 }

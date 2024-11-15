@@ -1,6 +1,6 @@
 EnvironmentManagerRole:
   Metadata:
-    'aws:copilot:description': 'An IAM Role to describe resources in your environment'
+    'aws:copilot:description': 'An IAM Role {{- if .PermissionsBoundary}} with permissions boundary {{.PermissionsBoundary}} {{- end}} to describe resources in your environment'
   DeletionPolicy: Retain
   Type: AWS::IAM::Role
   DependsOn: CloudformationExecutionRole
@@ -13,12 +13,32 @@ EnvironmentManagerRole:
         Principal:
           AWS: !Sub ${ToolsAccountPrincipalARN}
         Action: sts:AssumeRole
+    {{- if .PermissionsBoundary}}
+    PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/{{.PermissionsBoundary}}'
+    {{- end}}
     Path: /
     Policies:
     - PolicyName: root
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
+{{- if .HasImportedCerts}}
+        - Sid: ImportedCertificates
+          Effect: Allow
+          Action: [
+            acm:DescribeCertificate
+          ]
+          Resource:
+{{- range $arn := .PublicHTTPConfig.ImportedCertARNs}}
+          - "{{$arn}}"
+{{- end}}
+{{- range $arn := .PrivateHTTPConfig.ImportedCertARNs}}
+          - "{{$arn}}"
+{{- end}}
+{{- if and .CDNConfig .CDNConfig.ImportedCertificate}}
+          - "{{.CDNConfig.ImportedCertificate}}"
+{{- end}}
+{{- end}}
         - Sid: CloudwatchLogs
           Effect: Allow
           Action: [
@@ -61,19 +81,28 @@ EnvironmentManagerRole:
             "ecs:DescribeTaskDefinition",
             "ecs:ListTaskDefinitions",
             "ecs:ListClusters",
-            "ecs:RunTask"
+            "ecs:RunTask",
+            "ecs:ListServicesByNamespace"
           ]
           Resource: "*"
         - Sid: ExecuteCommand
           Effect: Allow
           Action: [
-            "ecs:ExecuteCommand"
+            "ecs:ExecuteCommand",
+            "ssm:StartSession"
           ]
           Resource: "*"
           Condition:
             StringEquals:
               'aws:ResourceTag/copilot-application': !Sub '${AppName}'
-              'aws:ResourceTag/copilot-environment': !Sub '${EnvironmentName}' 
+              'aws:ResourceTag/copilot-environment': !Sub '${EnvironmentName}'
+        - Sid: StartStateMachine
+          Effect: Allow
+          Action:
+            - "states:StartExecution"
+            - "states:DescribeStateMachine"
+          Resource:
+            - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AppName}-${EnvironmentName}-*"
         - Sid: CloudFormation
           Effect: Allow
           Action: [
@@ -149,6 +178,12 @@ EnvironmentManagerRole:
           ]
           Resource:
             - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/copilot/${AppName}/${EnvironmentName}/secrets/*'
+        - Sid: SSMSession
+          Effect: Allow
+          Action:
+            - ssm:StartSession
+          Resource:
+            - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-StartPortForwardingSessionToRemoteHost"
         - Sid: ELBv2
           Effect: Allow
           Action: [
@@ -207,10 +242,18 @@ EnvironmentManagerRole:
             "kms:Decrypt"
           ]
           Resource: "*"
+{{- if .PublicHTTPConfig.ELBAccessLogs.ShouldCreateBucket}}
+        - Sid: EmptyELBAccessLogsBucket
+          Effect: Allow
+          Action:
+            - s3:EmptyBucket
+          Resource: !Join [ "/" , [!GetAtt ELBAccessLogsBucket.Arn, "*"]]
+{{- end}}
         - Sid: PutObjectsToArtifactBucket
           Effect: Allow
           Action:
             - s3:PutObject
+            - s3:PutObjectAcl
           Resource:
           - {{.ArtifactBucketARN}}
           - {{.ArtifactBucketARN}}/*
@@ -236,7 +279,9 @@ EnvironmentManagerRole:
             "apprunner:ListServices",
             "apprunner:PauseService",
             "apprunner:ResumeService",
-            "apprunner:StartDeployment"
+            "apprunner:StartDeployment",
+            "apprunner:DescribeObservabilityConfiguration",
+            "apprunner:DescribeVpcIngressConnection"
           ]
           Resource: "*"
         - Sid: Tags
@@ -268,3 +313,14 @@ EnvironmentManagerRole:
             - 'cloudformation:DeleteStack'
           Resource:
             - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+        - Sid: ListStacks
+          Effect: Allow
+          Action:
+            - 'cloudformation:ListStacks'
+          Resource: "*"
+        - Sid: RDS
+          Effect: Allow
+          Action:
+            - 'rds:DescribeDBInstances'
+            - 'rds:DescribeDBClusters'
+          Resource: "*"

@@ -281,31 +281,99 @@ func TestBuildArgsOrStringTransformer_Transformer(t *testing.T) {
 	}
 }
 
+func TestAliasTransformer_Transformer(t *testing.T) {
+	testCases := map[string]struct {
+		original func(*Alias)
+		override func(*Alias)
+		wanted   func(*Alias)
+	}{
+		"advanced alias set to empty if string slice is not nil": {
+			original: func(a *Alias) {
+				a.AdvancedAliases = []AdvancedAlias{
+					{
+						Alias: aws.String("mockAlias"),
+					},
+				}
+			},
+			override: func(a *Alias) {
+				a.StringSliceOrString = StringSliceOrString{
+					StringSlice: []string{"mock", "string", "slice"},
+				}
+			},
+			wanted: func(a *Alias) {
+				a.StringSliceOrString.StringSlice = []string{"mock", "string", "slice"}
+			},
+		},
+		"StringSliceOrString set to empty if advanced alias is not nil": {
+			original: func(a *Alias) {
+				a.StringSliceOrString = StringSliceOrString{
+					StringSlice: []string{"mock", "string", "slice"},
+				}
+			},
+			override: func(a *Alias) {
+				a.AdvancedAliases = []AdvancedAlias{
+					{
+						Alias: aws.String("mockAlias"),
+					},
+				}
+			},
+			wanted: func(a *Alias) {
+				a.AdvancedAliases = []AdvancedAlias{
+					{
+						Alias: aws.String("mockAlias"),
+					},
+				}
+			},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			var dst, override, wanted Alias
+
+			tc.original(&dst)
+			tc.override(&override)
+			tc.wanted(&wanted)
+
+			// Perform default merge.
+			err := mergo.Merge(&dst, override, mergo.WithOverride)
+			require.NoError(t, err)
+
+			// Use custom transformer.
+			err = mergo.Merge(&dst, override, mergo.WithOverride, mergo.WithTransformers(aliasTransformer{}))
+			require.NoError(t, err)
+
+			require.NoError(t, err)
+			require.Equal(t, wanted, dst)
+		})
+	}
+}
+
 func TestStringSliceOrStringTransformer_Transformer(t *testing.T) {
 	testCases := map[string]struct {
-		original func(s *stringSliceOrString)
-		override func(s *stringSliceOrString)
-		wanted   func(s *stringSliceOrString)
+		original func(s *StringSliceOrString)
+		override func(s *StringSliceOrString)
+		wanted   func(s *StringSliceOrString)
 	}{
 		"string set to empty if string slice is not nil": {
-			original: func(s *stringSliceOrString) {
+			original: func(s *StringSliceOrString) {
 				s.String = aws.String("mockString")
 			},
-			override: func(s *stringSliceOrString) {
+			override: func(s *StringSliceOrString) {
 				s.StringSlice = []string{"mock", "string", "slice"}
 			},
-			wanted: func(s *stringSliceOrString) {
+			wanted: func(s *StringSliceOrString) {
 				s.StringSlice = []string{"mock", "string", "slice"}
 			},
 		},
 		"string slice set to empty if string is not nil": {
-			original: func(s *stringSliceOrString) {
+			original: func(s *StringSliceOrString) {
 				s.StringSlice = []string{"mock", "string", "slice"}
 			},
-			override: func(s *stringSliceOrString) {
+			override: func(s *StringSliceOrString) {
 				s.String = aws.String("mockString")
 			},
-			wanted: func(s *stringSliceOrString) {
+			wanted: func(s *StringSliceOrString) {
 				s.String = aws.String("mockString")
 			},
 		},
@@ -313,7 +381,7 @@ func TestStringSliceOrStringTransformer_Transformer(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			var dst, override, wanted stringSliceOrString
+			var dst, override, wanted StringSliceOrString
 
 			tc.original(&dst)
 			tc.override(&override)
@@ -395,48 +463,52 @@ func TestPlatformArgsOrStringTransformer_Transformer(t *testing.T) {
 	}
 }
 
-func TestHealthCheckArgsOrStringTransformer_Transformer(t *testing.T) {
+func TestPlacementArgsOrStringTransformer_Transformer(t *testing.T) {
+	mockPlacementStr := PlacementString("mockString")
 	testCases := map[string]struct {
-		original func(h *HealthCheckArgsOrString)
-		override func(h *HealthCheckArgsOrString)
-		wanted   func(h *HealthCheckArgsOrString)
+		original func(p *PlacementArgOrString)
+		override func(p *PlacementArgOrString)
+		wanted   func(p *PlacementArgOrString)
 	}{
 		"string set to empty if args is not nil": {
-			original: func(h *HealthCheckArgsOrString) {
-				h.HealthCheckPath = aws.String("mockPath")
+			original: func(p *PlacementArgOrString) {
+				p.PlacementString = &mockPlacementStr
 			},
-			override: func(h *HealthCheckArgsOrString) {
-				h.HealthCheckArgs = HTTPHealthCheckArgs{
-					Path:         aws.String("mockPathArgs"),
-					SuccessCodes: aws.String("200"),
+			override: func(p *PlacementArgOrString) {
+				p.PlacementArgs = PlacementArgs{
+					Subnets: SubnetListOrArgs{
+						IDs: []string{"id1"},
+					},
 				}
 			},
-			wanted: func(h *HealthCheckArgsOrString) {
-				h.HealthCheckArgs = HTTPHealthCheckArgs{
-					Path:         aws.String("mockPathArgs"),
-					SuccessCodes: aws.String("200"),
+			wanted: func(p *PlacementArgOrString) {
+				p.PlacementArgs = PlacementArgs{
+					Subnets: SubnetListOrArgs{
+						IDs: []string{"id1"},
+					},
 				}
 			},
 		},
 		"args set to empty if string is not nil": {
-			original: func(h *HealthCheckArgsOrString) {
-				h.HealthCheckArgs = HTTPHealthCheckArgs{
-					Path:         aws.String("mockPathArgs"),
-					SuccessCodes: aws.String("200"),
+			original: func(p *PlacementArgOrString) {
+				p.PlacementArgs = PlacementArgs{
+					Subnets: SubnetListOrArgs{
+						IDs: []string{"id1"},
+					},
 				}
 			},
-			override: func(h *HealthCheckArgsOrString) {
-				h.HealthCheckPath = aws.String("mockPath")
+			override: func(p *PlacementArgOrString) {
+				p.PlacementString = &mockPlacementStr
 			},
-			wanted: func(h *HealthCheckArgsOrString) {
-				h.HealthCheckPath = aws.String("mockPath")
+			wanted: func(p *PlacementArgOrString) {
+				p.PlacementString = &mockPlacementStr
 			},
 		},
 	}
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			var dst, override, wanted HealthCheckArgsOrString
+			var dst, override, wanted PlacementArgOrString
 
 			tc.original(&dst)
 			tc.override(&override)
@@ -447,13 +519,237 @@ func TestHealthCheckArgsOrStringTransformer_Transformer(t *testing.T) {
 			require.NoError(t, err)
 
 			// Use custom transformer.
-			err = mergo.Merge(&dst, override, mergo.WithOverride, mergo.WithTransformers(healthCheckArgsOrStringTransformer{}))
+			err = mergo.Merge(&dst, override, mergo.WithOverride, mergo.WithTransformers(placementArgOrStringTransformer{}))
 			require.NoError(t, err)
 
 			require.NoError(t, err)
 			require.Equal(t, wanted, dst)
 		})
 	}
+}
+
+func TestSubnetListOrArgsTransformer_Transformer(t *testing.T) {
+	mockSubnetIDs := []string{"id1", "id2"}
+	mockSubnetFromTags := map[string]StringSliceOrString{
+		"foo": {
+			String: aws.String("bar"),
+		},
+	}
+	testCases := map[string]struct {
+		original func(p *SubnetListOrArgs)
+		override func(p *SubnetListOrArgs)
+		wanted   func(p *SubnetListOrArgs)
+	}{
+		"string slice set to empty if args is not nil": {
+			original: func(s *SubnetListOrArgs) {
+				s.IDs = mockSubnetIDs
+			},
+			override: func(s *SubnetListOrArgs) {
+				s.SubnetArgs = SubnetArgs{
+					FromTags: mockSubnetFromTags,
+				}
+			},
+			wanted: func(s *SubnetListOrArgs) {
+				s.SubnetArgs = SubnetArgs{
+					FromTags: mockSubnetFromTags,
+				}
+			},
+		},
+		"args set to empty if string is not nil": {
+			original: func(s *SubnetListOrArgs) {
+				s.SubnetArgs = SubnetArgs{
+					FromTags: mockSubnetFromTags,
+				}
+			},
+			override: func(s *SubnetListOrArgs) {
+				s.IDs = mockSubnetIDs
+			},
+			wanted: func(s *SubnetListOrArgs) {
+				s.IDs = mockSubnetIDs
+			},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			var dst, override, wanted SubnetListOrArgs
+
+			tc.original(&dst)
+			tc.override(&override)
+			tc.wanted(&wanted)
+
+			// Perform default merge.
+			err := mergo.Merge(&dst, override, mergo.WithOverride)
+			require.NoError(t, err)
+
+			// Use custom transformer.
+			err = mergo.Merge(&dst, override, mergo.WithOverride, mergo.WithTransformers(subnetListOrArgsTransformer{}))
+			require.NoError(t, err)
+
+			require.NoError(t, err)
+			require.Equal(t, wanted, dst)
+		})
+	}
+}
+
+func TestServiceConnectTransformer_Transformer(t *testing.T) {
+	testCases := map[string]struct {
+		original func(p *ServiceConnectBoolOrArgs)
+		override func(p *ServiceConnectBoolOrArgs)
+		wanted   func(p *ServiceConnectBoolOrArgs)
+	}{
+		"bool set to empty if args is not nil": {
+			original: func(s *ServiceConnectBoolOrArgs) {
+				s.EnableServiceConnect = aws.Bool(false)
+			},
+			override: func(s *ServiceConnectBoolOrArgs) {
+				s.ServiceConnectArgs = ServiceConnectArgs{
+					Alias: aws.String("api"),
+				}
+			},
+			wanted: func(s *ServiceConnectBoolOrArgs) {
+				s.ServiceConnectArgs = ServiceConnectArgs{
+					Alias: aws.String("api"),
+				}
+			},
+		},
+		"args set to empty if bool is not nil": {
+			original: func(s *ServiceConnectBoolOrArgs) {
+				s.ServiceConnectArgs = ServiceConnectArgs{
+					Alias: aws.String("api"),
+				}
+			},
+			override: func(s *ServiceConnectBoolOrArgs) {
+				s.EnableServiceConnect = aws.Bool(true)
+			},
+			wanted: func(s *ServiceConnectBoolOrArgs) {
+				s.EnableServiceConnect = aws.Bool(true)
+			},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			var dst, override, wanted ServiceConnectBoolOrArgs
+
+			tc.original(&dst)
+			tc.override(&override)
+			tc.wanted(&wanted)
+
+			// Perform default merge.
+			err := mergo.Merge(&dst, override, mergo.WithOverride)
+			require.NoError(t, err)
+
+			// Use custom transformer.
+			err = mergo.Merge(&dst, override, mergo.WithOverride, mergo.WithTransformers(serviceConnectTransformer{}))
+			require.NoError(t, err)
+
+			require.NoError(t, err)
+			require.Equal(t, wanted, dst)
+		})
+	}
+}
+
+type unionTransformerTest[Basic, Advanced any] struct {
+	original Union[Basic, Advanced]
+	override Union[Basic, Advanced]
+	expected Union[Basic, Advanced]
+}
+
+func TestTransformer_Generic(t *testing.T) {
+	runUnionTransformerTests(t, map[string]unionTransformerTest[any, any]{
+		"switches to Simple from Advanced if overridden": {
+			original: AdvancedToUnion[any, any](nil),
+			override: BasicToUnion[any, any](nil),
+			expected: BasicToUnion[any, any](nil),
+		},
+		"switches to Advanced from Simple if overridden": {
+			original: BasicToUnion[any, any](nil),
+			override: AdvancedToUnion[any, any](nil),
+			expected: AdvancedToUnion[any, any](nil),
+		},
+		"switches to Simple if original unset": {
+			original: Union[any, any]{},
+			override: BasicToUnion[any, any](nil),
+			expected: BasicToUnion[any, any](nil),
+		},
+		"switches to Advanced if original unset": {
+			original: Union[any, any]{},
+			override: AdvancedToUnion[any, any](nil),
+			expected: AdvancedToUnion[any, any](nil),
+		},
+	})
+}
+
+func TestTransformer_StringOrHealthCheckArgs(t *testing.T) {
+	runUnionTransformerTests(t, map[string]unionTransformerTest[string, HTTPHealthCheckArgs]{
+		"string unset if args set": {
+			original: BasicToUnion[string, HTTPHealthCheckArgs]("mockPath"),
+			override: AdvancedToUnion[string](HTTPHealthCheckArgs{
+				Path:         aws.String("mockPathArgs"),
+				SuccessCodes: aws.String("200"),
+			}),
+			expected: AdvancedToUnion[string](HTTPHealthCheckArgs{
+				Path:         aws.String("mockPathArgs"),
+				SuccessCodes: aws.String("200"),
+			}),
+		},
+		"args unset if string set": {
+			original: AdvancedToUnion[string](HTTPHealthCheckArgs{
+				Path:         aws.String("mockPathArgs"),
+				SuccessCodes: aws.String("200"),
+			}),
+			override: BasicToUnion[string, HTTPHealthCheckArgs]("mockPath"),
+			expected: BasicToUnion[string, HTTPHealthCheckArgs]("mockPath"),
+		},
+		"string merges correctly": {
+			original: BasicToUnion[string, HTTPHealthCheckArgs]("path"),
+			override: BasicToUnion[string, HTTPHealthCheckArgs]("newPath"),
+			expected: BasicToUnion[string, HTTPHealthCheckArgs]("newPath"),
+		},
+		"args merge correctly": {
+			original: AdvancedToUnion[string](HTTPHealthCheckArgs{
+				Path:             aws.String("mockPathArgs"),
+				SuccessCodes:     aws.String("200"),
+				HealthyThreshold: aws.Int64(10),
+			}),
+			override: AdvancedToUnion[string](HTTPHealthCheckArgs{
+				SuccessCodes:       aws.String("420"),
+				UnhealthyThreshold: aws.Int64(20),
+			}),
+			expected: AdvancedToUnion[string](HTTPHealthCheckArgs{
+				Path:               aws.String("mockPathArgs"), // merged unchanged
+				SuccessCodes:       aws.String("420"),          // updated
+				HealthyThreshold:   aws.Int64(10),              // comes from original
+				UnhealthyThreshold: aws.Int64(20),              // comes from override
+			}),
+		},
+	})
+}
+
+func runUnionTransformerTests[Basic, Advanced any](t *testing.T, tests map[string]unionTransformerTest[Basic, Advanced]) {
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Perform default merge.
+			err := mergo.Merge(&tc.original, tc.override, mergo.WithOverride)
+			require.NoError(t, err)
+
+			// Use custom transformer.
+			err = mergo.Merge(&tc.original, tc.override, mergo.WithOverride, mergo.WithTransformers(unionTransformer{}))
+			require.NoError(t, err)
+
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, tc.original)
+		})
+	}
+}
+
+func TestUnionPanicRecover(t *testing.T) {
+	// trick the transformer logic into thinking
+	// this is the real manifest.Union type
+	type Union[T any] struct{}
+	err := mergo.Merge(&Union[any]{}, &Union[any]{}, mergo.WithTransformers(unionTransformer{}))
+	require.EqualError(t, err, "override union: reflect: call of reflect.Value.Call on zero Value")
 }
 
 func TestCountTransformer_Transformer(t *testing.T) {
@@ -515,7 +811,13 @@ func TestCountTransformer_Transformer(t *testing.T) {
 }
 
 func TestAdvancedCountTransformer_Transformer(t *testing.T) {
-	mockPerc := Percentage(80)
+	perc := Percentage(80)
+	mockConfig := ScalingConfigOrT[Percentage]{
+		Value: &perc,
+	}
+	mockReq := ScalingConfigOrT[int]{
+		Value: aws.Int(42),
+	}
 	testCases := map[string]struct {
 		original func(a *AdvancedCount)
 		override func(a *AdvancedCount)
@@ -529,15 +831,15 @@ func TestAdvancedCountTransformer_Transformer(t *testing.T) {
 				a.Range = Range{
 					Value: (*IntRangeBand)(aws.String("1-10")),
 				}
-				a.CPU = &mockPerc
-				a.Requests = aws.Int(42)
+				a.CPU = mockConfig
+				a.Requests = mockReq
 			},
 			wanted: func(a *AdvancedCount) {
 				a.Range = Range{
 					Value: (*IntRangeBand)(aws.String("1-10")),
 				}
-				a.CPU = &mockPerc
-				a.Requests = aws.Int(42)
+				a.CPU = mockConfig
+				a.Requests = mockReq
 			},
 		},
 		"auto scaling set to empty if spot is not nil": {
@@ -545,8 +847,8 @@ func TestAdvancedCountTransformer_Transformer(t *testing.T) {
 				a.Range = Range{
 					Value: (*IntRangeBand)(aws.String("1-10")),
 				}
-				a.CPU = &mockPerc
-				a.Requests = aws.Int(42)
+				a.CPU = mockConfig
+				a.Requests = mockReq
 			},
 			override: func(a *AdvancedCount) {
 				a.Spot = aws.Int(24)
@@ -571,6 +873,62 @@ func TestAdvancedCountTransformer_Transformer(t *testing.T) {
 
 			// Use custom transformer.
 			err = mergo.Merge(&dst, override, mergo.WithOverride, mergo.WithTransformers(advancedCountTransformer{}))
+			require.NoError(t, err)
+
+			require.NoError(t, err)
+			require.Equal(t, wanted, dst)
+		})
+	}
+}
+
+func TestScalingConfigOrT_Transformer(t *testing.T) {
+	perc := Percentage(80)
+	mockConfig := AdvancedScalingConfig[Percentage]{
+		Value: &perc,
+	}
+	testCases := map[string]struct {
+		original func(s *ScalingConfigOrT[Percentage])
+		override func(s *ScalingConfigOrT[Percentage])
+		wanted   func(s *ScalingConfigOrT[Percentage])
+	}{
+		"advanced config value set to nil if percentage is not nil": {
+			original: func(s *ScalingConfigOrT[Percentage]) {
+				s.ScalingConfig = mockConfig
+			},
+			override: func(s *ScalingConfigOrT[Percentage]) {
+				s.Value = &perc
+			},
+			wanted: func(s *ScalingConfigOrT[Percentage]) {
+				s.Value = &perc
+			},
+		},
+		"percentage set to nil if advanced config value is not nil": {
+			original: func(s *ScalingConfigOrT[Percentage]) {
+				s.Value = &perc
+			},
+			override: func(s *ScalingConfigOrT[Percentage]) {
+				s.ScalingConfig = mockConfig
+			},
+			wanted: func(s *ScalingConfigOrT[Percentage]) {
+				s.ScalingConfig = mockConfig
+			},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			var dst, override, wanted ScalingConfigOrT[Percentage]
+
+			tc.original(&dst)
+			tc.override(&override)
+			tc.wanted(&wanted)
+
+			// Perform default merge.
+			err := mergo.Merge(&dst, override, mergo.WithOverride)
+			require.NoError(t, err)
+
+			// Use custom transformer.
+			err = mergo.Merge(&dst, override, mergo.WithOverride, mergo.WithTransformers(scalingConfigOrTTransformer[Percentage]{}))
 			require.NoError(t, err)
 
 			require.NoError(t, err)
@@ -716,17 +1074,17 @@ func TestEfsVolumeConfigurationTransformer_Transformer(t *testing.T) {
 				e.GID = aws.Uint32(53589793)
 			},
 			override: func(e *EFSVolumeConfiguration) {
-				e.FileSystemID = aws.String("mockFileSystem")
+				e.FileSystemID = StringOrFromCFN{Plain: aws.String("mockFileSystem")}
 				e.RootDirectory = aws.String("mockRootDir")
 			},
 			wanted: func(e *EFSVolumeConfiguration) {
-				e.FileSystemID = aws.String("mockFileSystem")
+				e.FileSystemID = StringOrFromCFN{Plain: aws.String("mockFileSystem")}
 				e.RootDirectory = aws.String("mockRootDir")
 			},
 		},
 		"BYO config set to empty if UID config is not empty": {
 			original: func(e *EFSVolumeConfiguration) {
-				e.FileSystemID = aws.String("mockFileSystem")
+				e.FileSystemID = StringOrFromCFN{FromCFN: fromCFN{Name: aws.String("mockFileSystem")}}
 				e.RootDirectory = aws.String("mockRootDir")
 			},
 			override: func(e *EFSVolumeConfiguration) {
@@ -820,37 +1178,43 @@ func TestSQSQueueOrBoolTransformer_Transformer(t *testing.T) {
 	}
 }
 
-func TestRoutingRuleConfigOrBoolTransformer_Transformer(t *testing.T) {
+func TestHTTPOrBoolTransformer_Transformer(t *testing.T) {
 	testCases := map[string]struct {
-		original func(r *RoutingRuleConfigOrBool)
-		override func(r *RoutingRuleConfigOrBool)
-		wanted   func(r *RoutingRuleConfigOrBool)
+		original func(r *HTTPOrBool)
+		override func(r *HTTPOrBool)
+		wanted   func(r *HTTPOrBool)
 	}{
 		"bool set to empty if config is not nil": {
-			original: func(r *RoutingRuleConfigOrBool) {
+			original: func(r *HTTPOrBool) {
 				r.Enabled = aws.Bool(true)
 			},
-			override: func(r *RoutingRuleConfigOrBool) {
-				r.RoutingRuleConfiguration = RoutingRuleConfiguration{
-					Path: aws.String("mockPath"),
+			override: func(r *HTTPOrBool) {
+				r.HTTP = HTTP{
+					Main: RoutingRule{
+						Path: aws.String("mockPath"),
+					},
 				}
 			},
-			wanted: func(r *RoutingRuleConfigOrBool) {
-				r.RoutingRuleConfiguration = RoutingRuleConfiguration{
-					Path: aws.String("mockPath"),
+			wanted: func(r *HTTPOrBool) {
+				r.HTTP = HTTP{
+					Main: RoutingRule{
+						Path: aws.String("mockPath"),
+					},
 				}
 			},
 		},
 		"config set to empty if bool is not nil": {
-			original: func(r *RoutingRuleConfigOrBool) {
-				r.RoutingRuleConfiguration = RoutingRuleConfiguration{
-					Path: aws.String("mockPath"),
+			original: func(r *HTTPOrBool) {
+				r.HTTP = HTTP{
+					Main: RoutingRule{
+						Path: aws.String("mockPath"),
+					},
 				}
 			},
-			override: func(r *RoutingRuleConfigOrBool) {
+			override: func(r *HTTPOrBool) {
 				r.Enabled = aws.Bool(false)
 			},
-			wanted: func(r *RoutingRuleConfigOrBool) {
+			wanted: func(r *HTTPOrBool) {
 				r.Enabled = aws.Bool(false)
 			},
 		},
@@ -858,7 +1222,7 @@ func TestRoutingRuleConfigOrBoolTransformer_Transformer(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			var dst, override, wanted RoutingRuleConfigOrBool
+			var dst, override, wanted HTTPOrBool
 
 			tc.original(&dst)
 			tc.override(&override)
@@ -869,7 +1233,7 @@ func TestRoutingRuleConfigOrBoolTransformer_Transformer(t *testing.T) {
 			require.NoError(t, err)
 
 			// Use custom transformer.
-			err = mergo.Merge(&dst, override, mergo.WithOverride, mergo.WithTransformers(routingRuleConfigOrBoolTransformer{}))
+			err = mergo.Merge(&dst, override, mergo.WithOverride, mergo.WithTransformers(httpOrBoolTransformer{}))
 			require.NoError(t, err)
 
 			require.NoError(t, err)
@@ -886,7 +1250,9 @@ func TestSecretTransformer_Transformer(t *testing.T) {
 	}{
 		`"from" set to empty when overriding with "secretsmanager"`: {
 			original: func(s *Secret) {
-				s.from = aws.String("/github/token")
+				s.from = StringOrFromCFN{
+					Plain: aws.String("/github/token"),
+				}
 			},
 			override: func(s *Secret) {
 				s.fromSecretsManager = secretsManagerSecret{
@@ -906,10 +1272,35 @@ func TestSecretTransformer_Transformer(t *testing.T) {
 				}
 			},
 			override: func(s *Secret) {
-				s.from = aws.String("/github/token")
+				s.from = StringOrFromCFN{
+					Plain: aws.String("/github/token"),
+				}
 			},
 			wanted: func(s *Secret) {
-				s.from = aws.String("/github/token")
+				s.from = StringOrFromCFN{
+					Plain: aws.String("/github/token"),
+				}
+			},
+		},
+		`"secretsmanager" set to empty when overriding with imported "from"`: {
+			original: func(s *Secret) {
+				s.fromSecretsManager = secretsManagerSecret{
+					Name: aws.String("aes128-1a2b3c"),
+				}
+			},
+			override: func(s *Secret) {
+				s.from = StringOrFromCFN{
+					FromCFN: fromCFN{
+						Name: aws.String("stack-SSMGHTokenName"),
+					},
+				}
+			},
+			wanted: func(s *Secret) {
+				s.from = StringOrFromCFN{
+					FromCFN: fromCFN{
+						Name: aws.String("stack-SSMGHTokenName"),
+					},
+				}
 			},
 		},
 	}
@@ -928,6 +1319,64 @@ func TestSecretTransformer_Transformer(t *testing.T) {
 
 			// Use custom transformer.
 			err = mergo.Merge(&dst, override, mergo.WithOverride, mergo.WithTransformers(secretTransformer{}))
+			require.NoError(t, err)
+
+			require.NoError(t, err)
+			require.Equal(t, wanted, dst)
+		})
+	}
+}
+
+func TestEnvironmentCDNConfigTransformer_Transformer(t *testing.T) {
+	testCases := map[string]struct {
+		original func(cfg *EnvironmentCDNConfig)
+		override func(cfg *EnvironmentCDNConfig)
+		wanted   func(cfg *EnvironmentCDNConfig)
+	}{
+		"cdnconfig set to empty if enabled is not nil": {
+			original: func(cfg *EnvironmentCDNConfig) {
+				cfg.Config = AdvancedCDNConfig{
+					Certificate: aws.String("arn:aws:acm:us-east-1:1111111:certificate/look-like-a-good-arn"),
+				}
+			},
+			override: func(cfg *EnvironmentCDNConfig) {
+				cfg.Enabled = aws.Bool(true)
+			},
+			wanted: func(cfg *EnvironmentCDNConfig) {
+				cfg.Enabled = aws.Bool(true)
+			},
+		},
+		"enabled set to nil if cdnconfig is not empty": {
+			original: func(cfg *EnvironmentCDNConfig) {
+				cfg.Enabled = aws.Bool(true)
+			},
+			override: func(cfg *EnvironmentCDNConfig) {
+				cfg.Config = AdvancedCDNConfig{
+					Certificate: aws.String("arn:aws:acm:us-east-1:1111111:certificate/look-like-a-good-arn"),
+				}
+			},
+			wanted: func(cfg *EnvironmentCDNConfig) {
+				cfg.Config = AdvancedCDNConfig{
+					Certificate: aws.String("arn:aws:acm:us-east-1:1111111:certificate/look-like-a-good-arn"),
+				}
+			},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			var dst, override, wanted EnvironmentCDNConfig
+
+			tc.original(&dst)
+			tc.override(&override)
+			tc.wanted(&wanted)
+
+			// Perform default merge.
+			err := mergo.Merge(&dst, override, mergo.WithOverride)
+			require.NoError(t, err)
+
+			// Use custom transformer.
+			err = mergo.Merge(&dst, override, mergo.WithOverride, mergo.WithTransformers(environmentCDNConfigTransformer{}))
 			require.NoError(t, err)
 
 			require.NoError(t, err)

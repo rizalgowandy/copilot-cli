@@ -23,8 +23,8 @@ const (
 
 // Names for tag filters
 var (
-	tagFilterNameForApp = fmt.Sprintf(ec2.TagFilterName, deploy.AppTagKey)
-	tagFilterNameForEnv = fmt.Sprintf(ec2.TagFilterName, deploy.EnvTagKey)
+	fmtTagFilterForApp = fmt.Sprintf(ec2.FmtTagFilter, deploy.AppTagKey)
+	fmtTagFilterForEnv = fmt.Sprintf(ec2.FmtTagFilter, deploy.EnvTagKey)
 )
 
 // EnvRunner can run an Amazon ECS task in the VPC and the cluster of an environment.
@@ -48,7 +48,10 @@ type EnvRunner struct {
 	VPCGetter            VPCGetter
 	ClusterGetter        ClusterGetter
 	Starter              Runner
-	EnvironmentDescriber EnvironmentDescriber
+	EnvironmentDescriber environmentDescriber
+
+	// Figures non-zero exit code of the task
+	NonZeroExitCodeGetter NonZeroExitCodeGetter
 }
 
 // Run runs tasks in the environment of the application, and returns the tasks.
@@ -75,7 +78,7 @@ func (r *EnvRunner) Run() ([]*Task, error) {
 	filters := r.filtersForVPCFromAppEnv()
 	// Use only environment security group https://github.com/aws/copilot-cli/issues/1882.
 	securityGroups, err := r.VPCGetter.SecurityGroups(append(filters, ec2.Filter{
-		Name:   fmt.Sprintf(ec2.TagFilterName, envSecurityGroupCFNLogicalIDTagKey),
+		Name:   fmt.Sprintf(ec2.FmtTagFilter, envSecurityGroupCFNLogicalIDTagKey),
 		Values: []string{envSecurityGroupCFNLogicalIDTagValue},
 	})...)
 	if err != nil {
@@ -87,10 +90,8 @@ func (r *EnvRunner) Run() ([]*Task, error) {
 	}
 
 	platformVersion := "LATEST"
-	enableExec := true
 	if IsValidWindowsOS(r.OS) {
 		platformVersion = "1.0.0"
-		enableExec = false
 	}
 
 	ecsTasks, err := r.Starter.RunTask(ecs.RunTaskInput{
@@ -101,7 +102,7 @@ func (r *EnvRunner) Run() ([]*Task, error) {
 		TaskFamilyName:  taskFamilyName(r.GroupName),
 		StartedBy:       startedBy,
 		PlatformVersion: platformVersion,
-		EnableExec:      enableExec,
+		EnableExec:      true,
 	})
 	if err != nil {
 		return nil, &errRunTask{
@@ -115,11 +116,11 @@ func (r *EnvRunner) Run() ([]*Task, error) {
 func (r *EnvRunner) filtersForVPCFromAppEnv() []ec2.Filter {
 	return []ec2.Filter{
 		{
-			Name:   tagFilterNameForEnv,
+			Name:   fmtTagFilterForEnv,
 			Values: []string{r.Env},
 		},
 		{
-			Name:   tagFilterNameForApp,
+			Name:   fmtTagFilterForApp,
 			Values: []string{r.App},
 		},
 	}
@@ -157,4 +158,17 @@ func containsString(s []string, search string) bool {
 		}
 	}
 	return false
+}
+
+// CheckNonZeroExitCode returns the status of the containers part of the given tasks.
+func (r *EnvRunner) CheckNonZeroExitCode(tasks []*Task) error {
+	cluster, err := r.ClusterGetter.ClusterARN(r.App, r.Env)
+	if err != nil {
+		return fmt.Errorf("get cluster for environment %s: %w", r.Env, err)
+	}
+	taskARNs := make([]string, len(tasks))
+	for idx, task := range tasks {
+		taskARNs[idx] = task.TaskARN
+	}
+	return r.NonZeroExitCodeGetter.HasNonZeroExitCode(taskARNs, cluster)
 }

@@ -1,5 +1,5 @@
 # job ls
-```bash
+```console
 $ copilot job ls
 ```
 
@@ -9,16 +9,16 @@ $ copilot job ls
 
 ## What are the flags?
 
-```bash
+```
   -a, --app string   Name of the application.
   -h, --help         help for ls
-      --json         Optional. Outputs in JSON format.
+      --json         Optional. Output in JSON format.
       --local        Only show jobs in the workspace.
 ```
 
 ## Example
 
 Lists all the jobs for the "myapp" application.
-```bash
+```console
 $ copilot job ls --app myapp
 ```

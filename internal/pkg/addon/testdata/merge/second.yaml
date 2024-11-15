@@ -16,7 +16,7 @@ Parameters:
     # Different indentation and order should not matter.
     Name:
       Type: String
-      Description: The name of the service, job, or workflow being deployed.
+      Description: Your workload's name.
     App: # Line comment is ignored.
         Type: String
         Description: Your application's name.
@@ -28,6 +28,7 @@ Parameters:
       Default: "false"
     InstanceType:
       Type: 'AWS::SSM::Parameter::Value<String>'
+      Default: mini
 
 Mappings:
   MyTableDynamoDBSettings:
@@ -78,6 +79,17 @@ Resources:
         PublicAccessBlockConfiguration:
           BlockPublicAcls: true
           BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        VersioningConfiguration:
+          Status: Enabled
+        LifecycleConfiguration:
+          Rules:
+            - Id: ExpireNonCurrentObjects
+              Status: Enabled
+              NoncurrentVersionExpirationInDays: 30
+              AbortIncompleteMultipartUpload:
+                DaysAfterInitiation: 1
 
     MyBucketAccessPolicy:
       Type: AWS::IAM::ManagedPolicy
@@ -86,7 +98,7 @@ Resources:
           - Grants CRUD access to MyBucket
           - { Bucket: !Ref MyBucket }
         PolicyDocument:
-          Version: 2012-10-17
+          Version: '2012-10-17'
           Statement:
             - Sid: S3ObjectActions
               Effect: Allow

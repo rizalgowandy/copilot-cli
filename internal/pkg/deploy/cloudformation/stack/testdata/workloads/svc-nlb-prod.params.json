@@ -1,23 +1,26 @@
 {
-  "Parameters" : { 
-    "AppName": "my-app",
-    "EnvName": "prod",
-    "WorkloadName": "fe",
-    "ContainerImage": "",
+  "Parameters": {
     "AddonsTemplateURL": "",
-    "TaskCPU": "256",
-    "TaskMemory": "512",
-    "TaskCount": "5",
-    "LogRetention": "30",
+    "AppName": "my-app",
+    "ArtifactKeyARN": "arn:aws:kms:us-west-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+    "ContainerImage": "",
     "ContainerPort": "80",
     "DNSDelegated": "true",
+    "EnvFileARN": "",
+    "EnvFileARNFornginx": "",
+    "EnvFileARNFortls": "",
+    "EnvName": "prod",
+    "LogRetention": "30",
+    "NLBAliases": "nlb.example.com",
+    "NLBPort": "443",
     "TargetContainer": "fe",
     "TargetPort": "80",
-    "EnvFileARN": "",
-    "NLBAliases": "nlb.example.com",
-    "NLBPort": "443"
+    "TaskCPU": "256",
+    "TaskCount": "5",
+    "TaskMemory": "512",
+    "WorkloadName": "fe"
   },
-  "Tags": { 
+  "Tags": {
     "copilot-application": "my-app",
     "copilot-environment": "prod",
     "copilot-service": "fe"

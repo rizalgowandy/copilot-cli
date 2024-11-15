@@ -9,13 +9,13 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 
 	"github.com/aws/copilot-cli/internal/pkg/aws/apprunner"
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/describe"
-	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
 	"github.com/aws/copilot-cli/internal/pkg/term/log"
 	termprogress "github.com/aws/copilot-cli/internal/pkg/term/progress"
@@ -72,7 +72,7 @@ func (o *resumeSvcOpts) Execute() error {
 	if err := o.initClients(); err != nil {
 		return err
 	}
-	svcARN, err := o.apprunnerDescriber.ServiceARN()
+	svcARN, err := o.apprunnerDescriber.ServiceARN(o.envName)
 	if err != nil {
 		return err
 	}
@@ -91,7 +91,7 @@ func (o *resumeSvcOpts) validateOrAskApp() error {
 		_, err := o.store.GetApplication(o.appName)
 		return err
 	}
-	appName, err := o.sel.Application(svcAppNamePrompt, svcAppNameHelpPrompt)
+	appName, err := o.sel.Application(svcAppNamePrompt, wkldAppNameHelpPrompt)
 	if err != nil {
 		return fmt.Errorf("select application: %w", err)
 	}
@@ -119,13 +119,13 @@ func (o *resumeSvcOpts) validateAndAskSvcEnvName() error {
 		svcResumeSvcNameHelpPrompt,
 		o.appName,
 		selector.WithEnv(o.envName),
-		selector.WithSvc(o.svcName),
-		selector.WithServiceTypesFilter([]string{manifest.RequestDrivenWebServiceType}),
+		selector.WithName(o.svcName),
+		selector.WithServiceTypesFilter([]string{manifestinfo.RequestDrivenWebServiceType}),
 	)
 	if err != nil {
 		return fmt.Errorf("select deployed service for application %s: %w", o.appName, err)
 	}
-	o.svcName = deployedService.Svc
+	o.svcName = deployedService.Name
 	o.envName = deployedService.Env
 	return nil
 }
@@ -151,7 +151,7 @@ func newResumeSvcOpts(vars resumeSvcVars) (*resumeSvcOpts, error) {
 	}
 	opts.initClients = func() error {
 		var a *apprunner.AppRunner
-		var d *describe.AppRunnerServiceDescriber
+		var d *describe.RDWebServiceDescriber
 		env, err := configStore.GetEnvironment(opts.appName, opts.envName)
 		if err != nil {
 			return fmt.Errorf("get environment: %w", err)
@@ -161,15 +161,14 @@ func newResumeSvcOpts(vars resumeSvcVars) (*resumeSvcOpts, error) {
 			return err
 		}
 		switch svc.Type {
-		case manifest.RequestDrivenWebServiceType:
+		case manifestinfo.RequestDrivenWebServiceType:
 			sess, err := sessProvider.FromRole(env.ManagerRoleARN, env.Region)
 			if err != nil {
 				return err
 			}
 			a = apprunner.New(sess)
-			d, err = describe.NewAppRunnerServiceDescriber(describe.NewServiceConfig{
+			d, err = describe.NewRDWebServiceDescriber(describe.NewServiceConfig{
 				App:         opts.appName,
-				Env:         opts.envName,
 				Svc:         opts.svcName,
 				ConfigStore: configStore,
 			})

@@ -1,5 +1,5 @@
 # env ls
-```bash
+```console
 $ copilot env ls [flags]
 ```
 
@@ -7,16 +7,16 @@ $ copilot env ls [flags]
 `copilot env ls` は、Application 内の全ての Environment を一覧表示します。
 
 ## フラグ
-```bash
+```
 -h, --help          help for ls
-    --json          Optional. Outputs in JSON format.
+    --json          Optional. Output in JSON format.
 -a, --app string    Name of the application.
 ```
 結果をプログラムでパースしたい場合 `--json` フラグを利用することができます。
 
 ## 実行例
 frontend Application の全ての Environment を一覧表示します。
-```bash
+```console
 $ copilot env ls -a frontend
 ```
 

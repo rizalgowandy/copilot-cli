@@ -4,11 +4,19 @@
 package cli
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/aws/copilot-cli/internal/pkg/aws/partitions"
+	"github.com/aws/copilot-cli/internal/pkg/aws/s3"
+	"github.com/aws/copilot-cli/internal/pkg/exec"
+	"github.com/aws/copilot-cli/internal/pkg/template/artifactpath"
+	"golang.org/x/mod/semver"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
@@ -37,7 +45,6 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation"
 	"github.com/aws/copilot-cli/internal/pkg/ecs"
-	"github.com/aws/copilot-cli/internal/pkg/exec"
 	"github.com/aws/copilot-cli/internal/pkg/repository"
 	"github.com/aws/copilot-cli/internal/pkg/task"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
@@ -56,6 +63,14 @@ const (
 	defaultDockerfilePath = "Dockerfile"
 	imageTagLatest        = "latest"
 	shortTaskIDLength     = 8
+)
+
+const (
+	envFileExt = ".env"
+
+	fmtTaskRunEnvUploadStart    = "Uploading env file to S3: %s"
+	fmtTaskRunEnvUploadFailed   = "Failed to upload your env file to S3: %s\n"
+	fmtTaskRunEnvUploadComplete = "Successfully uploaded your env file to S3: %s\n"
 )
 
 const (
@@ -99,6 +114,7 @@ type runTaskVars struct {
 	image                 string
 	dockerfilePath        string
 	dockerfileContextPath string
+	dockerfileBuildArgs   map[string]string
 	imageTag              string
 
 	taskRole      string
@@ -112,6 +128,7 @@ type runTaskVars struct {
 	useDefaultSubnetsAndCluster bool
 
 	envVars                  map[string]string
+	envFile                  string
 	secrets                  map[string]string
 	acknowledgeSecretsAccess bool
 	command                  string
@@ -158,15 +175,18 @@ type runTaskOpts struct {
 	configureECSServiceDescriber func(session *session.Session) ecs.ECSServiceDescriber
 	configureServiceDescriber    func(session *session.Session) ecs.ServiceDescriber
 	configureJobDescriber        func(session *session.Session) ecs.JobDescriber
+	configureUploader            func(session *session.Session) uploader
 
 	// Functions to generate a task run command.
 	runTaskRequestFromECSService func(client ecs.ECSServiceDescriber, cluster, service string) (*ecs.RunTaskRequest, error)
 	runTaskRequestFromService    func(client ecs.ServiceDescriber, app, env, svc string) (*ecs.RunTaskRequest, error)
 	runTaskRequestFromJob        func(client ecs.JobDescriber, app, env, job string) (*ecs.RunTaskRequest, error)
 
-	// Cached variables to hold SSM Param and Secrets Manager Secrets
-	ssmParamSecrets       map[string]string
-	secretsManagerSecrets map[string]string
+	// Cached variables.
+	ssmParamSecrets         map[string]string
+	secretsManagerSecrets   map[string]string
+	envFileARN              string
+	envCompatibilityChecker func(app, env string) (versionCompatibilityChecker, error)
 }
 
 func newTaskRunOpts(vars runTaskVars) (*runTaskOpts, error) {
@@ -184,7 +204,7 @@ func newTaskRunOpts(vars runTaskVars) (*runTaskOpts, error) {
 		fs:                    &afero.Afero{Fs: afero.NewOsFs()},
 		store:                 store,
 		prompt:                prompter,
-		sel:                   selector.NewSelect(prompter, store),
+		sel:                   selector.NewAppEnvSelector(prompter, store),
 		spinner:               termprogress.NewSpinner(log.DiagnosticWriter),
 		provider:              sessProvider,
 		secretsManagerSecrets: make(map[string]string),
@@ -196,7 +216,7 @@ func newTaskRunOpts(vars runTaskVars) (*runTaskOpts, error) {
 		if err != nil {
 			return fmt.Errorf("configure task runner: %w", err)
 		}
-		opts.deployer = cloudformation.New(opts.sess)
+		opts.deployer = cloudformation.New(opts.sess, cloudformation.WithProgressTracker(os.Stderr))
 		opts.defaultClusterGetter = awsecs.New(opts.sess)
 		opts.publicIPGetter = ec2.New(opts.sess)
 		return nil
@@ -220,6 +240,20 @@ func newTaskRunOpts(vars runTaskVars) (*runTaskOpts, error) {
 	}
 	opts.configureJobDescriber = func(session *session.Session) ecs.JobDescriber {
 		return ecs.New(session)
+	}
+	opts.configureUploader = func(session *session.Session) uploader {
+		return s3.New(session)
+	}
+	opts.envCompatibilityChecker = func(app, env string) (versionCompatibilityChecker, error) {
+		envDescriber, err := describe.NewEnvDescriber(describe.NewEnvDescriberConfig{
+			App:         app,
+			Env:         env,
+			ConfigStore: opts.store,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("new environment compatibility checker: %v", err)
+		}
+		return envDescriber, nil
 	}
 
 	opts.runTaskRequestFromECSService = ecs.RunTaskRequestFromECSService
@@ -249,6 +283,7 @@ func (o *runTaskOpts) configureRunner() (taskRunner, error) {
 			return nil, fmt.Errorf("create describer for environment %s in application %s: %w", o.env, o.appName, err)
 		}
 
+		ecsClient := ecs.New(o.sess)
 		return &task.EnvRunner{
 			Count:     o.count,
 			GroupName: o.groupName,
@@ -260,10 +295,11 @@ func (o *runTaskOpts) configureRunner() (taskRunner, error) {
 
 			OS: o.os,
 
-			VPCGetter:            vpcGetter,
-			ClusterGetter:        ecs.New(o.sess),
-			Starter:              ecsService,
-			EnvironmentDescriber: d,
+			VPCGetter:             vpcGetter,
+			ClusterGetter:         ecsClient,
+			Starter:               ecsService,
+			EnvironmentDescriber:  d,
+			NonZeroExitCodeGetter: ecsClient,
 		}, nil
 	}
 	return &task.ConfigRunner{
@@ -275,9 +311,10 @@ func (o *runTaskOpts) configureRunner() (taskRunner, error) {
 		SecurityGroups: o.securityGroups,
 		OS:             o.os,
 
-		VPCGetter:     vpcGetter,
-		ClusterGetter: ecsService,
-		Starter:       ecsService,
+		VPCGetter:             vpcGetter,
+		ClusterGetter:         ecsService,
+		Starter:               ecsService,
+		NonZeroExitCodeGetter: ecs.New(o.sess),
 	}, nil
 
 }
@@ -334,6 +371,10 @@ func (o *runTaskOpts) Validate() error {
 
 	if o.image != "" && o.dockerfileContextPath != "" {
 		return errors.New("cannot specify both `--image` and `--build-context`")
+	}
+
+	if o.image != "" && o.dockerfileBuildArgs != nil {
+		return errors.New("cannot specify both `--image` and `--build-args`")
 	}
 
 	if o.isDockerfileSet {
@@ -394,6 +435,12 @@ func (o *runTaskOpts) Validate() error {
 	for _, value := range o.secrets {
 		if !isSSM(value) && !isSecretsManager(value) {
 			return fmt.Errorf("must specify a valid secrets ARN")
+		}
+	}
+
+	if o.envFile != "" {
+		if filepath.Ext(o.envFile) != envFileExt {
+			return fmt.Errorf("environment file %s specified in --%s must have a %s file extension", o.envFile, envFileFlag, envFileExt)
 		}
 	}
 
@@ -469,6 +516,27 @@ func (o *runTaskOpts) confirmSecretsAccess() error {
 		return errors.New("access to secrets denied")
 	}
 
+	return nil
+}
+
+func (o *runTaskOpts) validateEnvCompatibilityForGenerateJobCmd(app, env string) error {
+	envStack, err := o.envCompatibilityChecker(app, env)
+	if err != nil {
+		return err
+	}
+	version, err := envStack.Version()
+	if err != nil {
+		return fmt.Errorf("retrieve version of environment stack %q in application %q: %v", env, app, err)
+	}
+	// The '--generate-cmd' flag was introduced in env v1.4.0. In env v1.8.0, EnvManagerRole took over, but
+	//"states:DescribeStateMachine" permissions weren't added until 1.12.2.
+	if semver.Compare(version, "v1.12.2") < 0 {
+		return &errFeatureIncompatibleWithEnvironment{
+			missingFeature: "task run --generate-cmd",
+			envName:        env,
+			curVersion:     version,
+		}
+	}
 	return nil
 }
 
@@ -644,21 +712,39 @@ func (o *runTaskOpts) Execute() error {
 		return err
 	}
 
+	var shouldUpdate bool
+
+	if o.envFile != "" {
+		envFileARN, err := o.deployEnvFile()
+		if err != nil {
+			return fmt.Errorf("deploy env file %s: %w", o.envFile, err)
+		}
+		o.envFileARN = envFileARN
+
+		shouldUpdate = true
+	}
+
 	// NOTE: if image is not provided, then we build the image and push to ECR repo
 	if o.image == "" {
-		if err := o.buildAndPushImage(); err != nil {
-			return err
+		uri, err := o.repository.Login()
+		if err != nil {
+			return fmt.Errorf("login to docker: %w", err)
 		}
 
 		tag := imageTagLatest
 		if o.imageTag != "" {
 			tag = o.imageTag
 		}
-		uri, err := o.repository.URI()
-		if err != nil {
-			return fmt.Errorf("get ECR repository URI: %w", err)
-		}
 		o.image = fmt.Sprintf(fmtImageURI, uri, tag)
+
+		if err := o.buildAndPushImage(uri); err != nil {
+			return err
+		}
+
+		shouldUpdate = true
+	}
+
+	if shouldUpdate {
 		if err := o.updateTaskResources(); err != nil {
 			return err
 		}
@@ -681,6 +767,9 @@ Did you tag your secrets with the "copilot-application" and "copilot-environment
 		if err := o.displayLogStream(); err != nil {
 			return err
 		}
+		if err := o.runner.CheckNonZeroExitCode(tasks); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -690,7 +779,11 @@ func (o *runTaskOpts) generateCommand() error {
 	if err != nil {
 		return err
 	}
-	log.Infoln(command.CLIString())
+	cliString, err := command.CLIString()
+	if err != nil {
+		return err
+	}
+	log.Infoln(cliString)
 	return nil
 }
 
@@ -741,16 +834,11 @@ func (o *runTaskOpts) runTaskCommand() (cliStringer, error) {
 }
 
 func (o *runTaskOpts) parseARN() (string, string, error) {
-	svcARN := awsecs.ServiceArn(o.generateCommandTarget)
-	clusterName, err := svcARN.ClusterName()
+	svcARN, err := awsecs.ParseServiceArn(o.generateCommandTarget)
 	if err != nil {
-		return "", "", fmt.Errorf("extract cluster name from arn %s: %w", svcARN, err)
+		return "", "", fmt.Errorf("parse service arn %s: %w", o.generateCommandTarget, err)
 	}
-	serviceName, err := svcARN.ServiceName()
-	if err != nil {
-		return "", "", fmt.Errorf("extract service name from arn %s: %w", svcARN, err)
-	}
-	return clusterName, serviceName, nil
+	return svcARN.ClusterName(), svcARN.ServiceName(), nil
 }
 
 func (o *runTaskOpts) runTaskCommandFromECSService(sess *session.Session, clusterName, serviceName string) (cliStringer, error) {
@@ -774,6 +862,9 @@ func (o *runTaskOpts) runTaskCommandFromWorkload(sess *session.Session, appName,
 	var cmd cliStringer
 	switch workloadType {
 	case workloadTypeJob:
+		if err := o.validateEnvCompatibilityForGenerateJobCmd(appName, envName); err != nil {
+			return nil, err
+		}
 		cmd, err = o.runTaskRequestFromJob(o.configureJobDescriber(sess), appName, envName, workloadName)
 		if err != nil {
 			return nil, fmt.Errorf("generate task run command from job %s of application %s deployed in environment %s: %w", workloadName, appName, envName, err)
@@ -862,7 +953,7 @@ func (o *runTaskOpts) showPublicIPs(tasks []*task.Task) {
 
 }
 
-func (o *runTaskOpts) buildAndPushImage() error {
+func (o *runTaskOpts) buildAndPushImage(uri string) error {
 	var additionalTags []string
 	if o.imageTag != "" {
 		additionalTags = append(additionalTags, o.imageTag)
@@ -872,11 +963,19 @@ func (o *runTaskOpts) buildAndPushImage() error {
 	if o.dockerfileContextPath != "" {
 		ctx = o.dockerfileContextPath
 	}
-	if _, err := o.repository.BuildAndPush(dockerengine.New(exec.NewCmd()), &dockerengine.BuildArguments{
+	buildArgs := &dockerengine.BuildArguments{
+		URI:        uri,
 		Dockerfile: o.dockerfilePath,
 		Context:    ctx,
 		Tags:       append([]string{imageTagLatest}, additionalTags...),
-	}); err != nil {
+		Args:       o.dockerfileBuildArgs,
+	}
+	buildArgsList, err := buildArgs.GenerateDockerBuildArgs(dockerengine.New(exec.NewCmd()))
+	if err != nil {
+		return fmt.Errorf("generate docker build args: %w", err)
+	}
+	log.Infof("Building your container image: docker %s\n", strings.Join(buildArgsList, " "))
+	if _, err := o.repository.BuildAndPush(context.Background(), buildArgs, log.DiagnosticWriter); err != nil {
 		return fmt.Errorf("build and push image: %w", err)
 	}
 	return nil
@@ -902,6 +1001,15 @@ func (o *runTaskOpts) deploy() error {
 		deployOpts = []awscloudformation.StackOption{awscloudformation.WithRoleARN(o.targetEnvironment.ExecutionRoleARN)}
 	}
 
+	var boundaryPolicy string
+	if o.appName != "" {
+		app, err := o.store.GetApplication(o.appName)
+		if err != nil {
+			return fmt.Errorf("get application: %w", err)
+		}
+		boundaryPolicy = app.PermissionsBoundary
+	}
+
 	secretsManagerSecrets, ssmParamSecrets := o.getCategorizedSecrets()
 
 	entrypoint, err := shlex.Split(o.entrypoint)
@@ -919,11 +1027,13 @@ func (o *runTaskOpts) deploy() error {
 		CPU:                   o.cpu,
 		Memory:                o.memory,
 		Image:                 o.image,
+		PermissionsBoundary:   boundaryPolicy,
 		TaskRole:              o.taskRole,
 		ExecutionRole:         o.executionRole,
 		Command:               command,
 		EntryPoint:            entrypoint,
 		EnvVars:               o.envVars,
+		EnvFileARN:            o.envFileARN,
 		SSMParamSecrets:       ssmParamSecrets,
 		SecretsManagerSecrets: secretsManagerSecrets,
 		OS:                    o.os,
@@ -932,7 +1042,55 @@ func (o *runTaskOpts) deploy() error {
 		Env:                   o.env,
 		AdditionalTags:        o.resourceTags,
 	}
-	return o.deployer.DeployTask(os.Stderr, input, deployOpts...)
+	return o.deployer.DeployTask(input, deployOpts...)
+}
+
+// deployEnvFileIfNeeded uploads the env file if needed, ensures that an S3 bucket is available, and returns the ARN of uploaded file.
+func (o *runTaskOpts) deployEnvFile() (string, error) {
+	if o.envFile == "" {
+		return "", nil
+	}
+
+	info, err := o.deployer.GetTaskStack(o.groupName)
+	if err != nil {
+		return "", fmt.Errorf("deploy env file: %w", err)
+	}
+
+	// push env file
+	o.spinner.Start(fmt.Sprintf(fmtTaskRunEnvUploadStart, color.HighlightUserInput(o.envFile)))
+	envFileARN, err := o.pushEnvFileToS3(info.BucketName)
+	if err != nil {
+		o.spinner.Stop(log.Serrorf(fmtTaskRunEnvUploadFailed, color.HighlightUserInput(o.envFile)))
+		return "", err
+	}
+	o.spinner.Stop(log.Ssuccessf(fmtTaskRunEnvUploadComplete, color.HighlightUserInput(o.envFile)))
+
+	return envFileARN, nil
+}
+
+// pushEnvFileToS3 reads an env file from disk, uploads it to a unique path, and then returns the ARN of the env file.
+func (o *runTaskOpts) pushEnvFileToS3(bucket string) (string, error) {
+	content, err := afero.ReadFile(o.fs, o.envFile)
+	if err != nil {
+		return "", fmt.Errorf("read env file %s: %w", o.envFile, err)
+	}
+	reader := bytes.NewReader(content)
+
+	uploader := o.configureUploader(o.sess)
+	url, err := uploader.Upload(bucket, artifactpath.EnvFiles(o.envFile, content), reader)
+	if err != nil {
+		return "", fmt.Errorf("put env file %s artifact to bucket %s: %w", o.envFile, bucket, err)
+	}
+	bucket, key, err := s3.ParseURL(url)
+	if err != nil {
+		return "", fmt.Errorf("parse s3 url: %w", err)
+	}
+	// The app and environment are always within the same partition.
+	partition, err := partitions.Region(aws.StringValue(o.sess.Config.Region)).Partition()
+	if err != nil {
+		return "", err
+	}
+	return s3.FormatARN(partition.ID(), fmt.Sprintf("%s/%s", bucket, key)), nil
 }
 
 func (o *runTaskOpts) validateAppName() error {
@@ -983,7 +1141,7 @@ func (o *runTaskOpts) askEnvName() error {
 		return nil
 	}
 
-	env, err := o.sel.Environment(taskRunEnvPrompt, taskRunEnvPromptHelp, o.appName, appEnvOptionNone)
+	env, err := o.sel.Environment(taskRunEnvPrompt, taskRunEnvPromptHelp, o.appName, prompt.Option{Value: appEnvOptionNone})
 	if err != nil {
 		return fmt.Errorf("ask for environment: %w", err)
 	}
@@ -1023,7 +1181,9 @@ func BuildTaskRunCmd() *cobra.Command {
   Run a task using the current workspace with specific subnets and security groups.
   /code $ copilot task run --subnets subnet-123,subnet-456 --security-groups sg-123,sg-456
   Run a task with a command.
-  /code $ copilot task run --command "python migrate-script.py"`,
+  /code $ copilot task run --command "python migrate-script.py"
+  Run a task with Docker build args.
+  /code $ copilot task run --build-args GO_VERSION=1.19"`,
 		RunE: runCmdE(func(cmd *cobra.Command, args []string) error {
 			opts, err := newTaskRunOpts(vars)
 			if err != nil {
@@ -1041,6 +1201,7 @@ func BuildTaskRunCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&vars.groupName, taskGroupNameFlag, nameFlagShort, "", taskGroupFlagDescription)
 
 	cmd.Flags().StringVar(&vars.dockerfilePath, dockerFileFlag, defaultDockerfilePath, dockerFileFlagDescription)
+	cmd.Flags().StringToStringVar(&vars.dockerfileBuildArgs, dockerFileBuildArgsFlag, nil, dockerFileBuildArgsFlagDescription)
 	cmd.Flags().StringVar(&vars.dockerfileContextPath, dockerFileContextFlag, "", dockerFileContextFlagDescription)
 	cmd.Flags().StringVarP(&vars.image, imageFlag, imageFlagShort, "", imageFlagDescription)
 	cmd.Flags().StringVar(&vars.imageTag, imageTagFlag, "", taskImageTagFlagDescription)
@@ -1061,6 +1222,7 @@ func BuildTaskRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&vars.os, osFlag, "", osFlagDescription)
 	cmd.Flags().StringVar(&vars.arch, archFlag, "", archFlagDescription)
 	cmd.Flags().StringToStringVar(&vars.envVars, envVarsFlag, nil, envVarsFlagDescription)
+	cmd.Flags().StringVar(&vars.envFile, envFileFlag, "", envFileFlagDescription)
 	cmd.Flags().StringToStringVar(&vars.secrets, secretsFlag, nil, secretsFlagDescription)
 	cmd.Flags().StringVar(&vars.command, commandFlag, "", runCommandFlagDescription)
 	cmd.Flags().StringVar(&vars.entrypoint, entrypointFlag, "", entrypointFlagDescription)
@@ -1075,6 +1237,7 @@ func BuildTaskRunCmd() *cobra.Command {
 
 	buildFlags := pflag.NewFlagSet("Build", pflag.ContinueOnError)
 	buildFlags.AddFlag(cmd.Flags().Lookup(dockerFileFlag))
+	buildFlags.AddFlag(cmd.Flags().Lookup(dockerFileBuildArgsFlag))
 	buildFlags.AddFlag(cmd.Flags().Lookup(dockerFileContextFlag))
 	buildFlags.AddFlag(cmd.Flags().Lookup(imageFlag))
 	buildFlags.AddFlag(cmd.Flags().Lookup(imageTagFlag))
@@ -1096,8 +1259,8 @@ func BuildTaskRunCmd() *cobra.Command {
 	taskFlags.AddFlag(cmd.Flags().Lookup(osFlag))
 	taskFlags.AddFlag(cmd.Flags().Lookup(archFlag))
 	taskFlags.AddFlag(cmd.Flags().Lookup(envVarsFlag))
+	taskFlags.AddFlag(cmd.Flags().Lookup(envFileFlag))
 	taskFlags.AddFlag(cmd.Flags().Lookup(secretsFlag))
-	taskFlags.AddFlag(cmd.Flags().Lookup(acknowledgeSecretsAccessFlag))
 	taskFlags.AddFlag(cmd.Flags().Lookup(commandFlag))
 	taskFlags.AddFlag(cmd.Flags().Lookup(entrypointFlag))
 	taskFlags.AddFlag(cmd.Flags().Lookup(resourceTagsFlag))
@@ -1105,6 +1268,7 @@ func BuildTaskRunCmd() *cobra.Command {
 	utilityFlags := pflag.NewFlagSet("Utility", pflag.ContinueOnError)
 	utilityFlags.AddFlag(cmd.Flags().Lookup(followFlag))
 	utilityFlags.AddFlag(cmd.Flags().Lookup(generateCommandFlag))
+	utilityFlags.AddFlag(cmd.Flags().Lookup(acknowledgeSecretsAccessFlag))
 
 	// prettify help menu.
 	cmd.Annotations = map[string]string{

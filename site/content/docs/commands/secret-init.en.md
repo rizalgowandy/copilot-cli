@@ -1,5 +1,5 @@
 # secret init
-```
+```console
 $ copilot secret init
 ```
 
@@ -7,9 +7,6 @@ $ copilot secret init
 `copilot secret init` creates or updates secrets as [SecureString parameters](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-parameter-store.html#what-is-a-parameter) in SSM Parameter Store for your application.
 
 A secret can have different values in each of your existing environments, and is accessible by your services or jobs from the same application and environment.
-
-!!! attention 
-    Secrets are not supported for Request-Driven Web Services.
 
 ## What are the flags?
 ```
@@ -25,16 +22,16 @@ A secret can have different values in each of your existing environments, and is
 ```
 ## How can I use it?
 Create a secret with prompts. You will be prompted for the name of the secret, and its values in each of your existing environments.
-```
+```console
 $ copilot secret init
 ```
 
 Create a secret named `db_password` in multiple environments. You will be prompted for the `db_password`'s values you want for each of your existing environments.
-```
+```console
 $ copilot secret init --name db_password
 ```
 Create secrets from `input.yml`. For the format of the YAML file, please see <a href="#secret-init-cli-input-yaml">below</a>.
-```
+```console
 $ copilot secret init --cli-input-yaml input.yml
 ```
 

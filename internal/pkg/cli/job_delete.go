@@ -6,6 +6,8 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
+	"slices"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
@@ -20,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/copilot-cli/internal/pkg/aws/ecr"
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
+	clideploy "github.com/aws/copilot-cli/internal/pkg/cli/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
@@ -39,15 +42,9 @@ const (
 )
 
 const (
-	fmtJobStackDeleteStart        = "Deleting the stack of job %s from environment %s."
-	fmtJobStackDeleteFailed       = "Failed to delete the stack of job %s from environment %s: %v.\n"
-	fmtJobStackDeleteComplete     = "Deleted the stack of job %s from environment %s.\n"
-	fmtJobDeleteResourcesStart    = "Deleting resources of job %s from application %s."
-	fmtJobDeleteResourcesFailed   = "Failed to delete resources of job %s from application %s.\n"
-	fmtJobDeleteResourcesComplete = "Deleted resources of job %s from application %s.\n"
-	fmtJobTasksStopStart          = "Stopping running tasks of job %s from environment %s."
-	fmtJobTasksStopFailed         = "Failed to stop running tasks of job %s from environment %s: %v.\n"
-	fmtJobTasksStopComplete       = "Stopped running tasks of job %s from environment %s.\n"
+	fmtJobTasksStopStart    = "Stopping running tasks of job %s from environment %s."
+	fmtJobTasksStopFailed   = "Failed to stop running tasks of job %s from environment %s: %v.\n"
+	fmtJobTasksStopComplete = "Stopped running tasks of job %s from environment %s.\n"
 )
 
 var (
@@ -90,11 +87,11 @@ func newDeleteJobOpts(vars deleteJobVars) (*deleteJobOpts, error) {
 		store:   store,
 		spinner: termprogress.NewSpinner(log.DiagnosticWriter),
 		prompt:  prompt.New(),
-		sel:     selector.NewConfigSelect(prompter, store),
+		sel:     selector.NewConfigSelector(prompter, store),
 		sess:    provider,
-		appCFN:  cloudformation.New(defaultSession),
+		appCFN:  cloudformation.New(defaultSession, cloudformation.WithProgressTracker(os.Stderr)),
 		newWlDeleter: func(session *session.Session) wlDeleter {
-			return cloudformation.New(session)
+			return cloudformation.New(session, cloudformation.WithProgressTracker(os.Stderr))
 		},
 		newImageRemover: func(session *session.Session) imageRemover {
 			return ecr.New(session)
@@ -257,12 +254,9 @@ func (o *deleteJobOpts) deleteJobs(envs []*config.Environment) error {
 			return err
 		}
 		// Delete job stack
-		o.spinner.Start(fmt.Sprintf(fmtJobStackDeleteStart, o.name, env.Name))
-		if err = o.deleteStack(sess, env.Name); err != nil {
-			o.spinner.Stop(log.Serrorf(fmtJobStackDeleteFailed, o.name, env.Name, err))
+		if err = o.deleteStack(sess, env); err != nil {
 			return err
 		}
-		o.spinner.Stop(log.Ssuccessf(fmtJobStackDeleteComplete, o.name, env.Name))
 		// Delete orphan tasks
 		if err = o.deleteTasks(sess, env.Name); err != nil {
 			return err
@@ -271,12 +265,13 @@ func (o *deleteJobOpts) deleteJobs(envs []*config.Environment) error {
 	return nil
 }
 
-func (o *deleteJobOpts) deleteStack(sess *session.Session, env string) error {
+func (o *deleteJobOpts) deleteStack(sess *session.Session, env *config.Environment) error {
 	cfClient := o.newWlDeleter(sess)
 	if err := cfClient.DeleteWorkload(deploy.DeleteWorkloadInput{
-		Name:    o.name,
-		EnvName: env,
-		AppName: o.appName,
+		Name:             o.name,
+		EnvName:          env.Name,
+		AppName:          o.appName,
+		ExecutionRoleARN: env.ExecutionRoleARN,
 	}); err != nil {
 		return fmt.Errorf("delete job stack: %w", err)
 	}
@@ -305,13 +300,12 @@ func (o *deleteJobOpts) needsAppCleanup() bool {
 func (o *deleteJobOpts) emptyECRRepos(envs []*config.Environment) error {
 	var uniqueRegions []string
 	for _, env := range envs {
-		if !contains(env.Region, uniqueRegions) {
+		if !slices.Contains(uniqueRegions, env.Region) {
 			uniqueRegions = append(uniqueRegions, env.Region)
 		}
 	}
 
-	// TODO: centralized ECR repo name
-	repoName := fmt.Sprintf("%s/%s", o.appName, o.name)
+	repoName := clideploy.RepoName(o.appName, o.name)
 	for _, region := range uniqueRegions {
 		sess, err := o.sess.DefaultWithRegion(region)
 		if err != nil {
@@ -331,14 +325,11 @@ func (o *deleteJobOpts) removeJobFromApp() error {
 		return err
 	}
 
-	o.spinner.Start(fmt.Sprintf(fmtJobDeleteResourcesStart, o.name, o.appName))
 	if err := o.appCFN.RemoveJobFromApp(proj, o.name); err != nil {
 		if !isStackSetNotExistsErr(err) {
-			o.spinner.Stop(log.Serrorf(fmtJobDeleteResourcesFailed, o.name, o.appName))
 			return err
 		}
 	}
-	o.spinner.Stop(log.Ssuccessf(fmtJobDeleteResourcesComplete, o.name, o.appName))
 	return nil
 }
 
@@ -354,7 +345,7 @@ func (o *deleteJobOpts) deleteSSMParam() error {
 func (o *deleteJobOpts) RecommendActions() error {
 	logRecommendedActions([]string{
 		fmt.Sprintf("Run %s to update the corresponding pipeline if it exists.",
-			color.HighlightCode("copilot pipeline update")),
+			color.HighlightCode("copilot pipeline deploy")),
 	})
 	return nil
 }

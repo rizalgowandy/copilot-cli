@@ -57,28 +57,20 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
               Service: ecs-tasks.amazonaws.com
             Action: 'sts:AssumeRole'
       Policies:
-        - PolicyName: 'DenyIAMExceptTaggedRoles'
+        - PolicyName: 'DenyIAM'
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: 'Deny'
                 Action: 'iam:*'
                 Resource: '*'
-              - Effect: 'Allow'
-                Action: 'sts:AssumeRole'
-                Resource:
-                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
-                Condition:
-                  StringEquals:
-                    'iam:ResourceTag/copilot-application': !Sub '${AppName}'
-                    'iam:ResourceTag/copilot-environment': !Sub '${EnvName}'
-
   DiscoveryService:
     Type: AWS::ServiceDiscovery::Service
     Metadata:
@@ -139,6 +131,10 @@ Resources:
       DeploymentConfiguration:
         MinimumHealthyPercent: 100
         MaximumPercent: 200
+        Alarms:
+          AlarmNames: []
+          Enable: false
+          Rollback: true
       # This may need to be adjusted if the container takes a while to start up
       HealthCheckGracePeriodSeconds: 60
       LoadBalancers:
@@ -161,7 +157,7 @@ Resources:
         - Key: deregistration_delay.timeout_seconds
           Value: 60
         - Key: stickiness.enabled
-          Value: !Ref Stickiness
+          Value: true
       TargetType: ip
       VpcId:
         Fn::ImportValue:

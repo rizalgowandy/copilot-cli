@@ -19,19 +19,30 @@ StateMachine:
       TaskDefinition: !Ref TaskDefinition
       Partition: !Ref AWS::Partition
       Subnets:
+      {{- if .Network.SubnetIDs}}
+        Fn::Join:
+          - '","'
+          - {{- range $id := .Network.SubnetIDs}}
+            - {{$id}}
+            {{- end}}
+      {{- else}}
         Fn::Join:
           - '","'
           - Fn::Split:
             - ','
             - Fn::ImportValue: !Sub '${AppName}-${EnvName}-{{.Network.SubnetsType}}'
+      {{- end}}
       AssignPublicIp: {{.Network.AssignPublicIP}}
       SecurityGroups:
         Fn::Join:
           - '","'
-          - - Fn::ImportValue: !Sub "${AppName}-${EnvName}-EnvironmentSecurityGroup"
-            {{- range $sg := .Network.SecurityGroups }}
-            - {{$sg}}
-            {{- end }}
+          - {{if not .Network.DenyDefaultSecurityGroup}}- Fn::ImportValue: !Sub "${AppName}-${EnvName}-EnvironmentSecurityGroup" {{end}}
+            {{- range $sg := .Network.SecurityGroups}}
+            {{- if not $sg.RequiresImport}}
+            - {{$sg.Value}}
+            {{- else}}
+            - Fn::ImportValue: {{$sg.Value}} {{- end}}
+            {{- end}}
             {{- if .NestedStack}}{{$stackName := .NestedStack.StackName}}{{range $sg := .NestedStack.SecurityGroupOutputs}}
             - Fn::GetAtt: [ {{$stackName}}, Outputs.{{$sg}}]
             {{- end}}{{end}}
@@ -39,18 +50,24 @@ StateMachine:
 {{include "state-machine-definition.json" . | indent 6}}      
       
 StateMachineRole:
+  Metadata:
+    'aws:copilot:description': 'An IAM role {{- if .PermissionsBoundary}} with permissions boundary {{.PermissionsBoundary}} {{- end}} for a state machine to run ECS tasks in your cluster'
   Type: AWS::IAM::Role
   Properties:
     AssumeRolePolicyDocument:
-      Version: 2012-10-17
+      Version: '2012-10-17'
       Statement:
       - Effect: Allow
         Principal:
           Service: states.amazonaws.com
         Action: sts:AssumeRole
+    {{- if .PermissionsBoundary}}
+    PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/{{.PermissionsBoundary}}'
+    {{- end}}
     Policies:
     - PolicyName: StateMachine
       PolicyDocument:
+        Version: '2012-10-17'
         Statement:
         - Effect: Allow
           Action: iam:PassRole

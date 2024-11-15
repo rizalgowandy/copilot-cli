@@ -6,10 +6,16 @@ package cli
 import (
 	"context"
 	"fmt"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
 	rg "github.com/aws/copilot-cli/internal/pkg/aws/resourcegroups"
+
+	"io"
+	"sort"
+	"sync"
+	"time"
 
 	"github.com/aws/copilot-cli/internal/pkg/aws/codepipeline"
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
@@ -18,10 +24,6 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
 	"github.com/aws/copilot-cli/internal/pkg/term/selector"
 	"golang.org/x/sync/errgroup"
-	"io"
-	"sort"
-	"sync"
-	"time"
 
 	"github.com/aws/copilot-cli/internal/pkg/describe"
 	"github.com/aws/copilot-cli/internal/pkg/term/log"
@@ -66,10 +68,10 @@ func newShowAppOpts(vars showAppVars) (*showAppOpts, error) {
 		showAppVars:    vars,
 		store:          store,
 		w:              log.OutputWriter,
-		sel:            selector.NewSelect(prompt.New(), store),
+		sel:            selector.NewAppEnvSelector(prompt.New(), store),
 		deployStore:    deployStore,
 		codepipeline:   codepipeline.New(defaultSession),
-		pipelineLister: deploy.NewPipelineStore(vars.name, rg.New(defaultSession)),
+		pipelineLister: deploy.NewPipelineStore(rg.New(defaultSession)),
 		newVersionGetter: func(s string) (versionGetter, error) {
 			d, err := describe.NewAppDescriber(s)
 			if err != nil {
@@ -171,7 +173,7 @@ func (o *showAppOpts) description() (*describe.App, error) {
 		sort.Strings(wkldDeployedtoEnvs[k])
 	}
 
-	pipelines, err := o.pipelineLister.ListDeployedPipelines()
+	pipelines, err := o.pipelineLister.ListDeployedPipelines(o.name)
 	if err != nil {
 		return nil, fmt.Errorf("list pipelines in application %s: %w", o.name, err)
 	}
@@ -179,7 +181,7 @@ func (o *showAppOpts) description() (*describe.App, error) {
 	for _, pipeline := range pipelines {
 		info, err := o.codepipeline.GetPipeline(pipeline.ResourceName)
 		if err != nil {
-			return nil, fmt.Errorf("get info for pipeline %s: %w", pipeline.Name(), err)
+			return nil, fmt.Errorf("get info for pipeline %s: %w", pipeline.Name, err)
 		}
 		pipelineInfo = append(pipelineInfo, info)
 	}
@@ -190,7 +192,6 @@ func (o *showAppOpts) description() (*describe.App, error) {
 			Name:      env.Name,
 			AccountID: env.AccountID,
 			Region:    env.Region,
-			Prod:      env.Prod,
 		})
 	}
 	var trimmedSvcs []*config.Workload
@@ -216,14 +217,15 @@ func (o *showAppOpts) description() (*describe.App, error) {
 		return nil, fmt.Errorf("get version for application %s: %w", o.name, err)
 	}
 	return &describe.App{
-		Name:               app.Name,
-		Version:            version,
-		URI:                app.Domain,
-		Envs:               trimmedEnvs,
-		Services:           trimmedSvcs,
-		Jobs:               trimmedJobs,
-		Pipelines:          pipelineInfo,
-		WkldDeployedtoEnvs: wkldDeployedtoEnvs,
+		Name:                app.Name,
+		Version:             version,
+		URI:                 app.Domain,
+		PermissionsBoundary: app.PermissionsBoundary,
+		Envs:                trimmedEnvs,
+		Services:            trimmedSvcs,
+		Jobs:                trimmedJobs,
+		Pipelines:           pipelineInfo,
+		WkldDeployedtoEnvs:  wkldDeployedtoEnvs,
 	}, nil
 }
 

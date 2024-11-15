@@ -4,7 +4,7 @@ Sound fun? Let’s do it!
 
 ## Step 1: Download & Configure AWS Copilot
 
-You’ll need a few things to use AWS Copilot - the AWS Copilot binary, AWS CLI, Docker Desktop and AWS credentials.
+You’ll need a few things to use AWS Copilot - the AWS Copilot binary, AWS CLI, Docker Desktop (needs to be running) and AWS credentials.
 
 Follow our instructions here on how to set up and configure all these tools.
 
@@ -26,6 +26,9 @@ $ cd example
 
 Now this is where the fun starts! We have our service code and our Dockerfile and we want to get it deployed to AWS. Let’s have AWS Copilot help us do just that!
 
+!!! Attention
+    If you have an existing `copilot/` directory that you created for other purposes, you may find Copilot creating files in that directory. If this happens, you can make an empty directory also named `copilot/` closer to your working directory. Copilot will use this empty directory instead.
+
 From within your code directory run:
 
 ```bash
@@ -40,7 +43,7 @@ The next thing we’re going to do is answer a few questions from Copilot. Copil
 
 
 1. _“What would you like to name your application”_ - an application is a collection of services. In this example we’ll only have one service in our app, but if you wanted to have a multi-service app, Copilot makes that easy. Let’s call this app **example-app**.
-2. _“Which service type best represents your service's architecture?”_ - Copilot is asking us what we want our service to do - do we want it to service traffic? Do we want it to be a private backend service? For us, we want our app to be accessible from the web, so let's hit enter and select **Load Balanced Web Service**.
+2. _“Which service type best represents your service's architecture?”_ - Copilot is asking us what we want our service to do - do we want it to service traffic? Do we want it to be a private backend service? For us, we want our app to be accessible from the web, so let's hit 'Enter' to select **Load Balanced Web Service**.
 3. _“What do you want to name this Load Balanced Web Service?”_ - now what should we call our service in our app? Be as creative as you want - but I recommend naming this service **front-end**.
 4. _“Which Dockerfile would you like to use for front-end?”_ - go ahead and choose the default Dockerfile here. This is the service that Copilot will build and deploy for you.
 
@@ -50,9 +53,9 @@ Once you choose your Dockerfile, Copilot will start setting up the AWS infrastru
 
 Once Copilot finishes setting up the infrastructure to manage your app, you’ll be asked if you want to deploy your service to a test environment type **yes.**
 
-Now we can wait a few minutes ⏳ while Copilot sets up all the resources needed to run your service. After all the infrastructure for your service is set up, Copilot will build your image and push it to Amazon ECR, and start deploying to Amazon ECS.
+Now we can wait a few minutes ⏳ while Copilot sets up all the resources needed to run your service. After all the infrastructure for your service is set up, Copilot will build your image and push it to Amazon ECR, and start deploying to Amazon ECS on AWS Fargate.
 
-After your deployment completes your service will be up and running on AWS Fargate and Copilot will print a link to the URL 🎉!
+After your deployment completes, your service will be up and running and Copilot will print a link to the URL 🎉!
 
 <img width="834" alt="deploy" src="https://user-images.githubusercontent.com/879348/86040356-be107900-b9f8-11ea-82cd-3bf2a5eb5c9d.png">
 
@@ -68,6 +71,6 @@ $ copilot app delete
 
 ## Congratulations!
 
-Congratulations! You have learned how to set up, deploy, and delete your container application to Amazon ECS using AWS Copilot. AWS Copilot is a command line tool that helps you develop, release and operate your container apps on AWS.
+Congratulations! You have learned how to use AWS Copilot to set up your container application, deploy it to Amazon ECS on AWS Fargate, and delete it. AWS Copilot is a command line tool that helps you develop, release and operate your container apps on AWS.
 
 We hope you had fun deploying your app. Ready to dive deeper into AWS Copilot and learn how to build and manage production ready container apps on AWS? Check out the _Developing_ section in the sidebar.

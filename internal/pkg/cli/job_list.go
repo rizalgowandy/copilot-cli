@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
+	"github.com/spf13/afero"
 
 	"github.com/aws/copilot-cli/internal/pkg/cli/list"
 	"github.com/aws/copilot-cli/internal/pkg/config"
@@ -42,7 +43,7 @@ func newListJobOpts(vars listWkldVars) (*listJobOpts, error) {
 	if err != nil {
 		return nil, err
 	}
-	ws, err := workspace.New()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +60,7 @@ func newListJobOpts(vars listWkldVars) (*listJobOpts, error) {
 		listWkldVars: vars,
 
 		list: jobLister,
-		sel:  selector.NewSelect(prompt.New(), store),
+		sel:  selector.NewAppEnvSelector(prompt.New(), store),
 	}, nil
 }
 
@@ -74,7 +75,7 @@ func (o *listJobOpts) Ask() error {
 		return nil
 	}
 
-	name, err := o.sel.Application(jobListAppNamePrompt, svcAppNameHelpPrompt)
+	name, err := o.sel.Application(jobListAppNamePrompt, wkldAppNameHelpPrompt)
 	if err != nil {
 		return fmt.Errorf("select application name: %w", err)
 	}

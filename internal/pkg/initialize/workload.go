@@ -9,29 +9,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/copilot-cli/internal/pkg/config"
+	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
 	"github.com/aws/copilot-cli/internal/pkg/term/log"
 	"github.com/aws/copilot-cli/internal/pkg/workspace"
 )
 
 const (
-	fmtAddWlToAppStart    = "Creating ECR repositories for %s %s."
-	fmtAddWlToAppFailed   = "Failed to create ECR repositories for %s %s.\n\n"
-	fmtAddWlToAppComplete = "Created ECR repositories for %s %s.\n\n"
-)
-
-const (
 	jobWlType = "job"
 	svcWlType = "service"
-)
-
-const (
-	commonGRPCPort = uint16(50051)
 )
 
 var fmtErrUnrecognizedWlType = "unrecognized workload type %s"
@@ -47,13 +38,13 @@ type Store interface {
 
 // WorkloadAdder contains the methods needed to add jobs and services to an existing application.
 type WorkloadAdder interface {
-	AddJobToApp(app *config.Application, jobName string) error
-	AddServiceToApp(app *config.Application, serviceName string) error
+	AddJobToApp(app *config.Application, jobName string, opts ...cloudformation.AddWorkloadToAppOpt) error
+	AddServiceToApp(app *config.Application, serviceName string, opts ...cloudformation.AddWorkloadToAppOpt) error
 }
 
 // Workspace contains the methods needed to manipulate a Copilot workspace.
 type Workspace interface {
-	Path() (string, error)
+	Rel(path string) (string, error)
 	WriteJobManifest(marshaler encoding.BinaryMarshaler, jobName string) (string, error)
 	WriteServiceManifest(marshaler encoding.BinaryMarshaler, serviceName string) (string, error)
 }
@@ -66,13 +57,15 @@ type Prog interface {
 
 // WorkloadProps contains the information needed to represent a Workload (job or service).
 type WorkloadProps struct {
-	App            string
-	Type           string
-	Name           string
-	DockerfilePath string
-	Image          string
-	Platform       manifest.PlatformArgsOrString
-	Topics         []manifest.TopicSubscription
+	App                     string
+	Type                    string
+	Name                    string
+	DockerfilePath          string
+	Image                   string
+	Platform                manifest.PlatformArgsOrString
+	Topics                  []manifest.TopicSubscription
+	Queue                   manifest.SQSQueue
+	PrivateOnlyEnvironments []string
 }
 
 // JobProps contains the information needed to represent a Job.
@@ -89,7 +82,9 @@ type ServiceProps struct {
 	WorkloadProps
 	Port        uint16
 	HealthCheck manifest.ContainerHealthCheck
+	Private     bool
 	appDomain   *string
+	FileUploads []manifest.FileUpload
 }
 
 // WorkloadInitializer holds the clients necessary to initialize either a
@@ -99,6 +94,26 @@ type WorkloadInitializer struct {
 	Deployer WorkloadAdder
 	Ws       Workspace
 	Prog     Prog
+}
+
+// AddWorkloadToApp contains the logic to create the SSM parameter and perform the stackset template update required
+// to add any workload to the app. It does not write the manifest.
+func (w *WorkloadInitializer) AddWorkloadToApp(appName, name, workloadType string) error {
+	svcOrJob := svcWlType
+	if manifestinfo.IsTypeAJob(workloadType) {
+		svcOrJob = jobWlType
+	}
+
+	app, err := w.Store.GetApplication(appName)
+	if err != nil {
+		return fmt.Errorf("get application %s: %w", appName, err)
+	}
+	// addWlToAppandSSM only uses the App, Name, and Type
+	return w.addWlToAppAndSSM(app, WorkloadProps{
+		App:  appName,
+		Type: workloadType,
+		Name: name,
+	}, svcOrJob)
 }
 
 // Service writes the service manifest, creates an ECR repository, and adds the service to SSM.
@@ -111,12 +126,15 @@ func (w *WorkloadInitializer) Job(i *JobProps) (string, error) {
 	return w.initJob(i)
 }
 
-func (w *WorkloadInitializer) addWlToApp(app *config.Application, wlName string, wlType string) error {
+func (w *WorkloadInitializer) addWlToApp(app *config.Application, props WorkloadProps, wlType string) error {
 	switch wlType {
 	case svcWlType:
-		return w.Deployer.AddServiceToApp(app, wlName)
+		if props.Type == manifestinfo.StaticSiteType {
+			return w.Deployer.AddServiceToApp(app, props.Name, cloudformation.AddWorkloadToAppOptWithoutECR)
+		}
+		return w.Deployer.AddServiceToApp(app, props.Name)
 	case jobWlType:
-		return w.Deployer.AddJobToApp(app, wlName)
+		return w.Deployer.AddJobToApp(app, props.Name)
 	default:
 		return fmt.Errorf(fmtErrUnrecognizedWlType, wlType)
 	}
@@ -135,7 +153,7 @@ func (w *WorkloadInitializer) addWlToStore(wl *config.Workload, wlType string) e
 
 func (w *WorkloadInitializer) initJob(props *JobProps) (string, error) {
 	if props.DockerfilePath != "" {
-		path, err := relativeDockerfilePath(w.Ws, props.DockerfilePath)
+		path, err := w.Ws.Rel(props.DockerfilePath)
 		if err != nil {
 			return "", err
 		}
@@ -156,15 +174,13 @@ func (w *WorkloadInitializer) initJob(props *JobProps) (string, error) {
 		manifestExists = true
 		manifestPath = e.FileName
 	}
-	manifestPath, err = relPath(manifestPath)
-	if err != nil {
-		return "", err
-	}
 	manifestMsgFmt := "Wrote the manifest for %s %s at %s\n"
 	if manifestExists {
 		manifestMsgFmt = "Manifest file for %s %s already exists at %s, skipping writing it.\n"
 	}
-	log.Successf(manifestMsgFmt, jobWlType, color.HighlightUserInput(props.Name), color.HighlightResource(manifestPath))
+
+	path := displayPath(manifestPath)
+	log.Successf(manifestMsgFmt, jobWlType, color.HighlightUserInput(props.Name), color.HighlightResource(path))
 	var sched = props.Schedule
 	if props.Schedule == "" {
 		sched = "None"
@@ -182,12 +198,17 @@ func (w *WorkloadInitializer) initJob(props *JobProps) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return manifestPath, nil
+
+	path, err = w.Ws.Rel(manifestPath)
+	if err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func (w *WorkloadInitializer) initService(props *ServiceProps) (string, error) {
 	if props.DockerfilePath != "" {
-		path, err := relativeDockerfilePath(w.Ws, props.DockerfilePath)
+		path, err := w.Ws.Rel(props.DockerfilePath)
 		if err != nil {
 			return "", err
 		}
@@ -215,20 +236,16 @@ func (w *WorkloadInitializer) initService(props *ServiceProps) (string, error) {
 		manifestExists = true
 		manifestPath = e.FileName
 	}
-	manifestPath, err = relPath(manifestPath)
-	if err != nil {
-		return "", err
-	}
+
 	manifestMsgFmt := "Wrote the manifest for %s %s at %s\n"
 	if manifestExists {
 		manifestMsgFmt = "Manifest file for %s %s already exists at %s, skipping writing it.\n"
 	}
-	log.Successf(manifestMsgFmt, svcWlType, color.HighlightUserInput(props.Name), color.HighlightResource(manifestPath))
+
+	path := displayPath(manifestPath)
+	log.Successf(manifestMsgFmt, svcWlType, color.HighlightUserInput(props.Name), color.HighlightResource(path))
 
 	helpText := "Your manifest contains configurations like your container size and port."
-	if props.Port != 0 {
-		helpText = fmt.Sprintf("Your manifest contains configurations like your container size and port (:%d).", props.Port)
-	}
 	log.Infoln(color.Help(helpText))
 	log.Infoln()
 
@@ -236,7 +253,12 @@ func (w *WorkloadInitializer) initService(props *ServiceProps) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return manifestPath, nil
+
+	path, err = w.Ws.Rel(manifestPath)
+	if err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func (w *WorkloadInitializer) addSvcToAppAndSSM(app *config.Application, props WorkloadProps) error {
@@ -247,13 +269,11 @@ func (w *WorkloadInitializer) addJobToAppAndSSM(app *config.Application, props W
 	return w.addWlToAppAndSSM(app, props, jobWlType)
 }
 
+// addWlToAppAndSSM is a type-agnostic method to add a workload to the app and config store.
 func (w *WorkloadInitializer) addWlToAppAndSSM(app *config.Application, props WorkloadProps, wlType string) error {
-	w.Prog.Start(fmt.Sprintf(fmtAddWlToAppStart, wlType, props.Name))
-	if err := w.addWlToApp(app, props.Name, wlType); err != nil {
-		w.Prog.Stop(log.Serrorf(fmtAddWlToAppFailed, wlType, props.Name))
+	if err := w.addWlToApp(app, props, wlType); err != nil {
 		return fmt.Errorf("add %s %s to application %s: %w", wlType, props.Name, props.App, err)
 	}
-	w.Prog.Stop(log.Ssuccessf(fmtAddWlToAppComplete, wlType, props.Name))
 
 	if err := w.addWlToStore(&config.Workload{
 		App:  props.App,
@@ -268,12 +288,13 @@ func (w *WorkloadInitializer) addWlToAppAndSSM(app *config.Application, props Wo
 
 func newJobManifest(i *JobProps) (encoding.BinaryMarshaler, error) {
 	switch i.Type {
-	case manifest.ScheduledJobType:
+	case manifestinfo.ScheduledJobType:
 		return manifest.NewScheduledJob(&manifest.ScheduledJobProps{
 			WorkloadProps: &manifest.WorkloadProps{
-				Name:       i.Name,
-				Dockerfile: i.DockerfilePath,
-				Image:      i.Image,
+				Name:                    i.Name,
+				Dockerfile:              i.DockerfilePath,
+				Image:                   i.Image,
+				PrivateOnlyEnvironments: i.PrivateOnlyEnvironments,
 			},
 			HealthCheck: i.HealthCheck,
 			Platform:    i.Platform,
@@ -289,54 +310,52 @@ func newJobManifest(i *JobProps) (encoding.BinaryMarshaler, error) {
 
 func (w *WorkloadInitializer) newServiceManifest(i *ServiceProps) (encoding.BinaryMarshaler, error) {
 	switch i.Type {
-	case manifest.LoadBalancedWebServiceType:
+	case manifestinfo.LoadBalancedWebServiceType:
 		return w.newLoadBalancedWebServiceManifest(i)
-	case manifest.RequestDrivenWebServiceType:
-		return w.newRequestDrivenWebServiceManifest(i), nil
-	case manifest.BackendServiceType:
-		return newBackendServiceManifest(i)
-	case manifest.WorkerServiceType:
+	case manifestinfo.RequestDrivenWebServiceType:
+		return newRequestDrivenWebServiceManifest(i), nil
+	case manifestinfo.BackendServiceType:
+		return w.newBackendServiceManifest(i)
+	case manifestinfo.WorkerServiceType:
 		return newWorkerServiceManifest(i)
+	case manifestinfo.StaticSiteType:
+		return newStaticSiteServiceManifest(i)
 	default:
 		return nil, fmt.Errorf("service type %s doesn't have a manifest", i.Type)
 	}
 }
 
-func (w *WorkloadInitializer) newLoadBalancedWebServiceManifest(i *ServiceProps) (*manifest.LoadBalancedWebService, error) {
-	var httpVersion string
-	if i.Port == commonGRPCPort {
-		log.Infof("Detected port %s, setting HTTP protocol version to %s in the manifest.\n",
-			color.HighlightUserInput(strconv.Itoa(int(i.Port))), color.HighlightCode(manifest.GRPCProtocol))
-		httpVersion = manifest.GRPCProtocol
-	}
-	props := &manifest.LoadBalancedWebServiceProps{
+func (w *WorkloadInitializer) newLoadBalancedWebServiceManifest(inProps *ServiceProps) (*manifest.LoadBalancedWebService, error) {
+	outProps := &manifest.LoadBalancedWebServiceProps{
 		WorkloadProps: &manifest.WorkloadProps{
-			Name:       i.Name,
-			Dockerfile: i.DockerfilePath,
-			Image:      i.Image,
+			Name:                    inProps.Name,
+			Dockerfile:              inProps.DockerfilePath,
+			Image:                   inProps.Image,
+			PrivateOnlyEnvironments: inProps.PrivateOnlyEnvironments,
 		},
 		Path:        "/",
-		Port:        i.Port,
-		HTTPVersion: httpVersion,
-		HealthCheck: i.HealthCheck,
-		Platform:    i.Platform,
+		Port:        inProps.Port,
+		HealthCheck: inProps.HealthCheck,
+		Platform:    inProps.Platform,
 	}
-	existingSvcs, err := w.Store.ListServices(i.App)
+	existingSvcs, err := w.Store.ListServices(inProps.App)
 	if err != nil {
 		return nil, err
 	}
-	// We default to "/" for the first service, but if there's another
+	// We default to "/" for the first service or if the application is initialized with a domain, but if there's another
 	// Load Balanced Web Service, we use the svc name as the default, instead.
-	for _, existingSvc := range existingSvcs {
-		if existingSvc.Type == manifest.LoadBalancedWebServiceType && existingSvc.Name != i.Name {
-			props.Path = i.Name
-			break
+	if aws.StringValue(inProps.appDomain) == "" {
+		for _, existingSvc := range existingSvcs {
+			if existingSvc.Type == manifestinfo.LoadBalancedWebServiceType && existingSvc.Name != inProps.Name {
+				outProps.Path = inProps.Name
+				break
+			}
 		}
 	}
-	return manifest.NewLoadBalancedWebService(props), nil
+	return manifest.NewLoadBalancedWebService(outProps), nil
 }
 
-func (w *WorkloadInitializer) newRequestDrivenWebServiceManifest(i *ServiceProps) *manifest.RequestDrivenWebService {
+func newRequestDrivenWebServiceManifest(i *ServiceProps) *manifest.RequestDrivenWebService {
 	props := &manifest.RequestDrivenWebServiceProps{
 		WorkloadProps: &manifest.WorkloadProps{
 			Name:       i.Name,
@@ -345,62 +364,66 @@ func (w *WorkloadInitializer) newRequestDrivenWebServiceManifest(i *ServiceProps
 		},
 		Port:     i.Port,
 		Platform: i.Platform,
+		Private:  i.Private,
 	}
 	return manifest.NewRequestDrivenWebService(props)
 }
 
-func newBackendServiceManifest(i *ServiceProps) (*manifest.BackendService, error) {
-	return manifest.NewBackendService(manifest.BackendServiceProps{
+func (w *WorkloadInitializer) newBackendServiceManifest(i *ServiceProps) (*manifest.BackendService, error) {
+	outProps := manifest.BackendServiceProps{
 		WorkloadProps: manifest.WorkloadProps{
-			Name:       i.Name,
-			Dockerfile: i.DockerfilePath,
-			Image:      i.Image,
+			Name:                    i.Name,
+			Dockerfile:              i.DockerfilePath,
+			Image:                   i.Image,
+			PrivateOnlyEnvironments: i.PrivateOnlyEnvironments,
 		},
 		Port:        i.Port,
 		HealthCheck: i.HealthCheck,
 		Platform:    i.Platform,
-	}), nil
+	}
+
+	return manifest.NewBackendService(outProps), nil
 }
 
 func newWorkerServiceManifest(i *ServiceProps) (*manifest.WorkerService, error) {
 	return manifest.NewWorkerService(manifest.WorkerServiceProps{
 		WorkloadProps: manifest.WorkloadProps{
-			Name:       i.Name,
-			Dockerfile: i.DockerfilePath,
-			Image:      i.Image,
+			Name:                    i.Name,
+			Dockerfile:              i.DockerfilePath,
+			Image:                   i.Image,
+			PrivateOnlyEnvironments: i.PrivateOnlyEnvironments,
 		},
 		HealthCheck: i.HealthCheck,
 		Platform:    i.Platform,
 		Topics:      i.Topics,
+		Queue:       i.Queue,
 	}), nil
 }
 
-// relativeDockerfilePath returns the path from the workspace root to the Dockerfile.
-func relativeDockerfilePath(ws Workspace, path string) (string, error) {
-	wsRoot, err := ws.Path()
-	if err != nil {
-		return "", fmt.Errorf("get workspace path: %w", err)
-	}
-	absDfPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("get absolute path: %v", err)
-	}
-	relDfPath, err := filepath.Rel(wsRoot, absDfPath)
-	if err != nil {
-		return "", fmt.Errorf("find relative path from workspace root to Dockerfile: %v", err)
-	}
-	return relDfPath, nil
+func newStaticSiteServiceManifest(i *ServiceProps) (*manifest.StaticSite, error) {
+	return manifest.NewStaticSite(manifest.StaticSiteProps{
+		Name: i.Name,
+		StaticSiteConfig: manifest.StaticSiteConfig{
+			FileUploads: i.FileUploads,
+		},
+	}), nil
 }
 
-// relPath returns the path relative to the current working directory.
-func relPath(fullPath string) (string, error) {
-	wkdir, err := os.Getwd()
-	if err != nil {
-		return "", fmt.Errorf("get working directory: %w", err)
+// Copy of cli.displayPath
+func displayPath(target string) string {
+	if !filepath.IsAbs(target) {
+		return filepath.Clean(target)
 	}
-	path, err := filepath.Rel(wkdir, fullPath)
+
+	base, err := os.Getwd()
 	if err != nil {
-		return "", fmt.Errorf("get relative path of file: %w", err)
+		return filepath.Clean(target)
 	}
-	return path, nil
+
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		// No path from base to target available, return target as is.
+		return filepath.Clean(target)
+	}
+	return rel
 }

@@ -4,7 +4,7 @@
 
 Service を作成して AWS 上でコンテナを実行するための方法は複数あります。もっとも簡単な方法は、Dockerfile が置かれたディレクトリで `init` コマンドを実行することです。
 
-```bash
+```console
 $ copilot init
 ```
 
@@ -20,24 +20,26 @@ Service のタイプを選択すると、Copilot は Dockerfile 内で記述さ�
 
 ### インターネットから接続可能な Service
 
-インターネットからアクセス可能な Service を作る際の選択肢には次の２つがあります。
+インターネットからアクセス可能な Service を作る際の選択肢には次の 3 つがあります。
 
 * "Request-Driven Web Service" - Service 実行環境として AWS App Runner サービスを作成します。
+* "Static Site" - 静的 Web サイト用に専用の CloudFront ディストリビューションと S3 バケットをプロビジョニングします。
 * "Load Balanced Web Service" - Service 実行環境として Appplication Load Balancer (ALB)、Network Load Balancer、またはその両方を作成し、セキュリティグループ、ECS サービス (Fargate) を利用します。
 
 #### Request-Driven Web Service
-
 AWS App Runner を利用する Service で、受け付けるトラフィックに応じてオートスケールし、トラフィックがない場合は設定された最低インスタンス数までスケールダウンします。リクエスト量の大きな変化や恒常的な少ないリクエスト量が見込まれる HTTP サービスにとってもよりコスト効率の高い選択肢です。
+
 ECS とは異なり、 App Runner サービスはデフォルトでは VPC とは接続されていません。 Egress トラフィックを VPC 経由でルーティングするには、
-マニフェスト内の[`network`](../manifest/rd-web-service.ja.md#network)フィールドを設定します。
+Manifest 内の[`network`](../manifest/rd-web-service.ja.md#network)フィールドを設定します。
+
+#### Static Site
+Amazon CloudFront で配信され、S3 でホスティングされた静的 Web サイトです。Copilot は、静的 Web サイトホスティング用に構成された新しい S3 バケットへ静的アセットをアップロードします。[CloudFront コンテンツ配信ネットワーク (CDN)](../developing/content-delivery.ja.md) を使用したキャッシングにより、コストと速度を最適化します。再デプロイのたびに、以前のキャッシュは無効化されます。
 
 #### Load Balanced Web Service
-
 Application Load Balancer、Network Load Balancer、または両方をトラフィックの入り口として Fargate 上でタスクを実行する ECS サービスです。
 安定したリクエスト量が見込まれる場合、Service から VPC 内のリソースにアクセスする必要がある場合、あるいはより高度な設定の必要がある場合に適した HTTP または TCP サービスの選択肢です。
 
-Application Load Balancer は Environment レベルのリソースであり、Environment 内の全ての Load Balanced Web Service で共有されることに注意しましょう。
-詳細については、[こちら](environments.ja.md#load-balancers-and-dns)を確認してください。対照的に、 Network Load Balancer は Service レベルのリソースであり、 Service 間では共有されません。
+Application Load Balancer は Environment レベルのリソースであり、Environment 内の全ての Load Balanced Web Service で共有されることに注意しましょう。v1.32.0 では、[Load Balanced Web Service の Manifest](../manifest/lb-web-service.ja.md#http-alb) で指定することにより、既存の ALB を Service レベルでインポートできます。詳細については、[こちら](environments.ja.md#load-balancers-and-dns)を確認してください。対照的に、 Network Load Balancer は Service レベルのリソースであり、 Service 間では共有されません。
 
 下図は Application Load Balancer のみを含む Load Balanced Web Service の図です。
 
@@ -46,7 +48,7 @@ Application Load Balancer は Environment レベルのリソースであり、En
 ### Backend Service
 
 VPC 外部からアクセスさせる必要はないが、Application 内の他の Service からはアクセスできる必要があるという場合は、 __Backend Service__ を
-作りましょう。Copilot は AWS Fargate で実行される ECS サービスを作成しますが、インターネットに向けて開放されたエンドポイントを作成することはありません。
+作りましょう。Copilot は AWS Fargate で実行される ECS サービスを作成しますが、インターネットに向けて開放されたエンドポイントを作成することはありません。なお、Backend Service で内部ロードバランサーを利用することもできます。内部ロードバランサーを利用する Backend Service について知りたい場合は、[こちら](../developing/internal-albs.ja.md)を確認してください。
 
 ![backend-service-infra](https://user-images.githubusercontent.com/879348/86046929-e8673400-ba02-11ea-8676-addd6042e517.png)
 
@@ -65,7 +67,7 @@ Worker Service は次の要素で構成されます。
 
 ## Manifest と設定
 <!-- textlint-disable ja-technical-writing/ja-no-weak-phrase -->
-`copilot init` コマンドを実行すると、Copilot が `manifest.yml` という名前のファイルを copilot ディレクトリ内に作成していることに気づいたかもしれません。この Manifest ファイルは Service 用の共通設定やオプションを持ちます。どのようなオプションがあるかはあなたが選択した Service のタイプによって異なりますが、共通の設定には例えば Service に割り当てるメモリや CPU のリソース量、ヘルスチェック、環境変数といったものが含まれます。
+`copilot init` コマンドを実行すると、Copilot が `manifest.yml` という名前のファイルを `copilot/[service name]/` ディレクトリ内に作成していることに気づいたかもしれません。この Manifest ファイルは Service 用の共通設定やオプションを持ちます。どのようなオプションがあるかはあなたが選択した Service のタイプによって異なりますが、共通の設定には例えば Service に割り当てるメモリや CPU のリソース量、ヘルスチェック、環境変数といったものが含まれます。
 <!-- textlint-enable ja-technical-writing/ja-no-weak-phrase -->
 
 _front-end_ という名前の Load Balanced Web Service 用に作られた Manifest ファイルを覗いてみましょう。
@@ -113,7 +115,7 @@ Manifest ファイルの仕様について学ぶには、[Manifest](../manifest/
 
 Service をセットアップしたら、あるいは Manifest ファイルに変更を加えたら、deploy コマンドを実行して Service をデプロイできます。
 
-```bash
+```console
 $ copilot deploy
 ```
 
@@ -133,9 +135,9 @@ Service のセットアップと実行が完了したので、Copilot を使っ�
 
 ### Service に含まれるものを確認したい
 
-`copilot svc show` コマンドを実行すると、Service のサマリ情報を表示します。以下は Load Balanced Web Application での出力の例です。各 Environment ごとの Service 設定や Service のエンドポイント、あるいは環境変数などが確認できます。さらに、`--resources` フラグを利用することでこの Service に紐づけられたすべての AWS リソースを確認できます。
+`copilot svc show` コマンドを実行すると、Service のサマリ情報を表示します。以下は __Load Balanced Web Service__ での出力の例です。各 Environment ごとの Service 設定、設定済みのロールバックアラーム、Service のエンドポイント、あるいは環境変数や Service に渡されたシークレットなどが確認できます。さらに、`--resources` フラグを利用することでこの Service に紐づけられたすべての AWS リソースを確認できます。
 
-```bash
+```console
 $ copilot svc show
 About
 
@@ -146,60 +148,122 @@ About
 Configurations
 
   Environment       Tasks               CPU (vCPU)          Memory (MiB)        Port
+  -----------       -----               ----------          ------------        ----
   test              1                   0.25                512                 80
 
+Rollback Alarms
+
+  Name                              Environment  Description
+  ----                              -----------  -----------
+  my-app-test-front-end-CopilotRol  test         Roll back ECS service if CPU utilizat
+  lbackCPUAlarm                                  ion is greater than or equal to 50% t
+                                                 wice in 3 minutes.
+  
 Routes
 
   Environment       URL
+  -----------       ---
   test              http://my-ap-Publi-1RV8QEBNTEQCW-1762184596.ca-central-1.elb.amazonaws.com
 
-Service Discovery
-
-  Environment       Namespace
-  test              front-end.test.my-app.local:8080
+Internal Service Endpoints
+ 
+  Endpoint                          Environment  Type
+  --------                          -----------  ----
+  front-end:80                      test         Service Connect     
+  front-end.test.my-app.local:8080  test         Service Discovery
 
 Variables
 
-  Name                                Environment         Value
-  COPILOT_APPLICATION_NAME            test                my-app
-  COPILOT_ENVIRONMENT_NAME            test                test
-  COPILOT_LB_DNS                      test                my-ap-Publi-1RV8QEBNTEQCW-1762184596.ca-central-1.elb.amazonaws.com
-  COPILOT_SERVICE_DISCOVERY_ENDPOINT  test                test.my-app.local
-  COPILOT_SERVICE_NAME                test                front-end
-```
+  Name                                Container  Environment  Value
+  ----                                ---------  -----------  -----
+  COPILOT_APPLICATION_NAME            front-end  test         my-app
+  COPILOT_ENVIRONMENT_NAME              "        test         test
+  COPILOT_LB_DNS                        "        test         my-ap-Publi-1RV8QEBNTEQCW-1762184596.ca-central-1.elb.amazonaws.com
+  COPILOT_SERVICE_DISCOVERY_ENDPOINT    "        test         test.my-app.local
+  COPILOT_SERVICE_NAME                  "        test         front-end
+  
+Secrets
 
+  Name                   Container  Environment  Value
+  ----                   ---------  -----------  -----
+  GITHUB_WEBHOOK_SECRET  front-end  test         parameter/GH_WEBHOOK_SECRET
+```
+`copilot svc show` の出力は、Service の種類によって異なります。例えば、 __Static Site__ のサマリ情報には、 S3 バケットのコンテンツのツリー表示が含まれます。
+```console
+% copilot svc show
+Service name: static-site
+About
+
+  Application  my-app
+  Name         static-site
+  Type         Static Site
+
+Routes
+
+  Environment  URL
+  -----------  ---
+  test         https://d399t9j1xbplme.cloudfront.net/
+
+S3 Bucket Objects
+
+  Environment  test
+.
+├── ReadMe.md
+├── error.html
+├── index.html
+├── Images
+│   ├── SomeImage.PNG
+│   └── AnotherImage.PNG
+├── css
+│   ├── Style.css
+│   ├── all.min.css
+│   └── bootstrap.min.css
+└── images
+    └── bg-masthead.jpg
+ ```
+ 
 ### Service のステータスを確認したい
 
 Service のすべてのタスクは Healthy だろうか？なにかアラームが発火していないか？など、Service のステータスを確認できると便利です。Copilot では、`copilot svc status` でそのような情報のサマリを確認できます。
 
 
-```bash
+```console
 $ copilot svc status
-Service Status
+Service: front-end
+Task Summary
 
-  ACTIVE 1 / 1 running tasks (0 pending)
+  Running   ██████████  1/1 desired tasks are running
+  Health    ██████████  1/1 passes HTTP health checks
+            ██████████  1/1 passes container health checks
+Tasks
 
-Last Deployment
-
-  Updated At        12 minutes ago
-  Task Definition   arn:aws:ecs:ca-central-1:693652174720:task-definition/my-app-test-front-end:1
-
-Task Status
-
-  ID                Image Digest        Last Status         Health Status       Started At          Stopped At
-  37236ed3          da3cfcdd            RUNNING             HEALTHY             12 minutes ago      -
+  ID        Status      Revision    Started At     Cont. Health  HTTP Health  
+  --        ------      --------    ----------     ------------  -----------
+  37236ed3  RUNNING     9           12 minutes ago HEALTHY       HEALTHY
 
 Alarms
 
-  Name              Health              Last Updated        Reason
-  CPU-Utilization   OK                  5 minutes ago       -
+  Name                            Type          Condition                       Last Updated    Health
+  ----                            ----          ---------                       ------------    ------
+  TargetTracking-service/my-app-  Auto Scaling  CPUUtilization > 70.00 for 3 d  5 minutes ago   OK
+  test-Cluster-0jTKWTNBKviF/my-a                atapoints within 3 minutes                      
+  pp-test-front-end-Service-r5h6
+  hMZVbWkz-AlarmHigh-f0f31c7b-74
+  61-415c-9dfd-81b983cbe0df                                                                                          
+                                                                                                
+  TargetTracking-service/my-app-  Auto Scaling  CPUUtilization < 63.00 for 15   5 minutes ago   ALARM
+  test-Cluster-0jTKWTNBKviF/my-a                datapoints within 15 minutes                    
+  pp-test-front-end-Service-r5h6
+  hMZVbWkz-AlarmLow-698f9f17-6c0
+  c-4db1-8f1d-e23de97f5459
 ```
+`copilot svc show` と同様に、`copilot svc status` の出力はサービスの種類によって異なります。例えば、__Request-Driven Web Service__ の出力には、システムログが含まれます。 __Static Site__ の出力には、S3 バケットのオブジェクト数とサイズが含まれます。
 
 ### Service のログを確認したい
 
 Service のログの確認も簡単です。`copilot svc logs` コマンドを実行すると、直近の Service ログを確認できます。`--follow` フラグをあわせて利用すると、Service 側のログの出力をライブに追いかけることもできます。
 
-```bash
+```console
 $ copilot svc logs
 37236ed 10.0.0.30 🚑 Health-check ok!
 37236ed 10.0.0.30 🚑 Health-check ok!
@@ -207,3 +271,6 @@ $ copilot svc logs
 37236ed 10.0.0.30 🚑 Health-check ok!
 37236ed 10.0.0.30 🚑 Health-check ok!
 ```
+
+!!! info  
+    ログは Static Site Service では利用できません。

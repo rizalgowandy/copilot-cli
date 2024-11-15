@@ -3,15 +3,12 @@
 <a id="network" href="#network" class="field">`network`</a> <span class="type">Map</span>      
 The `network` section contains parameters for connecting to AWS resources in a VPC.
 
-<span class="parent-field">network.</span><a id="network-vpc" href="#network-vpc" class="field">`vpc`</a> <span class="type">Map</span>    
-Subnets and security groups attached to your tasks.
+<span class="parent-field">network.</span><a id="network-connect" href="#network-connect" class="field">`connect`</a> <span class="type">Bool or Map</span>    
+Enable [Service Connect](../developing/svc-to-svc-communication.en.md#service-connect) for your service, which makes the traffic between services load balanced and more resilient. Defaults to `false`.
 
-<span class="parent-field">network.vpc.</span><a id="network-vpc-placement" href="#network-vpc-placement" class="field">`placement`</a> <span class="type">String</span>  
-Must be one of `'public'` or `'private'`. Defaults to launching your tasks in public subnets.
+When using it as a map, you can specify which alias to use for this service. Note that the alias must be unique within the environment.
 
-!!! info
-    If you launch tasks in `'private'` subnets and use a Copilot-generated VPC, Copilot will automatically add NAT Gateways to your environment for internet connectivity. (See [pricing](https://aws.amazon.com/vpc/pricing/).) Alternatively, when running `copilot env init`, you can import an existing VPC with NAT Gateways, or one with VPC endpoints for isolated workloads. See our [custom environment resources](../developing/custom-environment-resources.en.md) page for more.
+<span class="parent-field">network.connect.</span><a id="network-connect-alias" href="#network-connect-alias" class="field">`alias`</a> <span class="type">String</span>  
+A custom DNS name for this service exposed to Service Connect. Defaults to the service name.
 
-<span class="parent-field">network.vpc.</span><a id="network-vpc-security-groups" href="#network-vpc-security-groups" class="field">`security_groups`</a> <span class="type">Array of Strings</span>  
-Additional security group IDs associated with your tasks. Copilot always includes a security group so containers within your environment
-can communicate with each other.
+{% include 'network-vpc.en.md' %}

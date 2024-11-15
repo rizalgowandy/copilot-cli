@@ -1,7 +1,13 @@
 # Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 AWSTemplateFormatVersion: 2010-09-09
-Description: CloudFormation template that represents a scheduled job on Amazon ECS. 
+Description: CloudFormation template that represents a scheduled job on Amazon ECS.
+Metadata:
+  Version: {{ .Version }}
+{{- if .SerializedManifest }}
+  Manifest: |
+{{indent 4 .SerializedManifest}}
+{{- end }}
 Parameters: 
   AppName:
     Type: String
@@ -29,11 +35,34 @@ Parameters:
     Description: 'URL of the environment file.'
     Type: String
     Default: ""
+{{- if .LogConfig}}
+  LoggingEnvFileARN:
+    Type: String
+    Description: 'URL of the environment file for the logging sidecar.'
+    Default: ""
+{{- end}}
+{{- range $sidecar := .Sidecars }}
+  EnvFileARNFor{{logicalIDSafe $sidecar.Name}}:
+    Type: String
+    Description: 'URL of the environment file for the {{$sidecar.Name}} sidecar.'
+    Default: ""
+{{- end }}
+  ArtifactKeyARN:
+    Type: String
+    Description: 'KMS Key used for encrypting artifacts'
 Conditions: 
   HasAddons: # If a bucket URL is specified, that means the template exists.
     !Not [!Equals [!Ref AddonsTemplateURL, ""]]
   HasEnvFile:
     !Not [!Equals [!Ref EnvFileARN, ""]]
+{{- if .LogConfig}}
+  HasLoggingEnvFile:
+    !Not [!Equals [!Ref LoggingEnvFileARN, ""]]
+{{- end}}
+{{- range $sidecar := .Sidecars }}
+  HasEnvFileFor{{logicalIDSafe $sidecar.Name}}:
+    !Not [!Equals [!Ref EnvFileARNFor{{ logicalIDSafe $sidecar.Name}}, ""]]
+{{- end }}
 Resources: 
 {{include "loggroup" . | indent 2}}
 

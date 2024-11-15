@@ -11,13 +11,19 @@
 ## Environment の作成
 
 Application 内に新しい Environment を作るには、作業ディレクトリにて `copilot env init` コマンドを実行します。コマンドを実行すると、作成する Environment の名前、そしてこの Environment の作成に利用する AWS プロファイルを Copilot が尋ねます。このプロファイルは AWS [名前付きプロファイル](https://docs.aws.amazon.com/ja_jp/cli/latest/userguide/cli-configure-profiles.html)と呼ばれるもので、特定の AWS アカウントやリージョンと紐づいた設定です。プロファイルを選ぶと、その新しい Environment は選択されたプロファイルと紐づいた AWS アカウントとリージョンに作成されます。
-
-
-```bash
+```console
 $ copilot env init
 ```
 
-`copilot env init` コマンドの実行後は、Copilot が数分間に渡って Environment 内のリソースをセットアップしていく様子を確認できます。すべてのリソースが作成されると、この Environment は Application アカウントにリンクされます。これにより、今後 Copilot コマンドを実行するユーザーがこの Environment アカウントそのものにアクセスができなくとも Application にリンクされた Environment として管理できるようになります。このリンク処理の中では、必要に応じて ECR リポジトリの作成と設定も行われます。
+`copilot env init` コマンドの実行後は、Copilot が 2 つの IAM ロールをセットアップしている様子を確認できます。その 2 つのロールは Environment の更新と管理に必要なものです。Environment が Application と異なる AWS アカウントで作成された場合、Envrionment は Application アカウントにリンクされます。これにより、今後 Copilot コマンドを実行するユーザーがこの Environment アカウントそのものにアクセスができなくとも Application にリンクされた Environment として管理できるようになります。Copilot は  `copilot/environments/[env name]/manifest.yml` に [Environment Manifest](../manifest/environment.ja.md) を作成します。
+
+## Environment のデプロイ
+
+デプロイをする前に、必要であれば、[Environment Manifest](../manifest/environment.ja.md)を修正して Environment を設定します。
+```console
+$ copilot env deploy
+```
+このステップでは、 Copilot は Environment のインフラストラクチャーリソース、例えば ECS クラスター、セキュリティグループ、プライベート DNS 名前空間を作成します。デプロイ後は、Envrionment Manifest を修正し、再び [`copilot env deploy`](../commands/env-deploy.ja.md) を実行するだけで、再デプロイできます。
 
 ### Service のデプロイ
 
@@ -30,19 +36,31 @@ $ copilot env init
 
 ### VPC やネットワークリソース
 
-各 Environment はそれぞれがマルチ AZ 構成の VPC を持ちます。VPC は Environment のネットワーク上の境界であり、VPC 内に入ってくるあるいは出ていくトラフィックを許可する、またはブロックするものとして機能します。Copilot は VPC を２つのアベイラビリティゾーンにまたがって作成するため、可用性とコストのバランス確保に役立ちます。各 AZ にはパブリックとプライベートのサブネットが１つずつ作成されます。
+各 Environment はそれぞれがマルチ AZ 構成の VPC を持ちます。VPC は Environment のネットワーク上の境界であり、VPC 内に入ってくるあるいは出ていくトラフィックを許可する、またはブロックするものとして機能します。Copilot は VPC を２つのアベイラビリティゾーンにまたがって作成します。[AWS best practices](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-best-practices.html)に従い、各 AZ はパブリックとプライベートサブネットがあります。 デフォルトでは、Service はパブリックサブネットで起動します。ただし、セキュリティのために、Environment 内の他のサービスからのアクセスのみに制限されています。ECS タスクはパブリックサブネットに配置され、NAT ゲートウエイを必要としないインターネットへのアクセスを許可することでコストを管理するのに役立ちます。
 
-Service はパブリックサブネットで実行されますが、ロードバランサーを経由したトラフィックのみを受け取ることができます。
+ワークロードサブネットの配置は Manifest 内の[`network.vpc.placement`](../manifest/lb-web-service.ja.md#network-vpc-placement)フィールドで変更できます。
 
 ### ロードバランサーと DNS
 
-"Load Balanced Web Service" タイプの Service を作ると、Copilot は Application Load Balancer を作成します。同一 Environment 内にデプロイされたすべての "Load Balanced Web Service" タイプの Service は、Service 固有のリスナーを作成してこの Application Load Balancer を共有します。ロードバランサーは VPC 内の各 Service と通信できるようにセットアップされます。
+Load Balanced Web Service または、Manifest に `http` フィールドを記載した Backend Service を作ると、Copilot は Environment 内の負荷分散する Service で共有される Application Load Balancer を作成します。Load Balanced Web Service の ALB は、インターネットからアクセス可能です。それに対して、Backend Service の ALB は内部向けです。Load Balancer は VPC 内の他の Copilot Service と通信可能です。
 
 所有するドメイン名を Route 53 に登録するよう、Application 作成時にオプションとして設定できます。ドメイン名の利用が設定されている場合、Copilot は各 Environment の作成時に `environment-name.app-name.your-domain.com` のような形でサブドメインを登録し、ACM を通して発行した証明書を Application Load Balancer に設定します。これにより Service が HTTPS を利用できるようになります。
 
+Manifest で [`http`](../manifest/backend-service.ja.md#http)フィールドが設定された Backend Service が Environment 内にデプロイされる場合、内部 ALB が作成されます。HTTPS のエンドポイントを利用する場合は、`copilot env init` を実行する際に、[`--import-cert-arns`](../commands/env-init.ja.md#what-are-the-flags) フラグを使用してください。そして、 プライベートサブネットのみの VPC をインポートします。内部 ALB に関する詳細は[こちら](../developing/internal-albs.ja.md)を確認してください。
+
+すでに VPC 内に ALB があり、Copilot が ALB を作成する代わりに既存の ALB を利用したい場合、Environment へデプロイする前に、Load Balanced Web Service (インターネット向け ALB) または、Backend Service (内部向け ALB) の Manifest で既存の ALB の名前または ARN を指定してください。
+
+```yaml
+http:
+  path: '/'
+  alb: [name or ARN]
+```
+
+インポートされた ALB は、すべての Load Balanced Web Service 間で共有されるのではなく、既存の ALB をインポートした Service にのみ関連付けられます。
+
 ## Environment のカスタマイズ
 
-既存リソースをインポートするためにコマンドのフラグを利用して Environment をインタラクティブにカスタマイズしたり、あるいはデフォルトの Environment リソースを変更したりできます。現時点では VPC リソースのみがカスタマイズ可能です。他のリソースをカスタマイズしたいというリクエストがある場合、お気軽にユースケースを添えた GitHub イシューを作成してくださいね！
+既存の Environment リソースをインポートする、コマンドでフラグを使う、[Environment Manifest](../manifest/environment.ja.md) を変更するといった方法で、デフォルトの設定をすることができます。もし、現在設定可能なリソースよりも多くの種類のリソースをカスタマイズしたい場合は、お気軽にユースケースを添えた GitHub イシューを作成してください！
 
 もっと詳しく知りたい方は、[Environment のリソースをカスタマイズする](../developing/custom-environment-resources.ja.md)ページをご覧ください。
 
@@ -54,7 +72,7 @@ Environment のセットアップが完了したので、Copilot を使って確
 
 Application 内にある全ての Environment を確認するには `copilot env ls` コマンドを利用します。
 
-```bash
+```console
 $ copilot env ls
 test
 production
@@ -64,16 +82,15 @@ production
 
 `copilot env show` コマンドを実行すると、Environment のサマリ情報を表示します。以下は _test_ Environment についての情報を確認する出力の例ですが、この Environment が作成されたアカウントやリージョン情報、あるいはデプロイされた Service や Environment 内のリソースに付与されるリソースタグ情報などが含まれます。さらに、`--resources` フラグを利用することでこの Environment に紐づけられたすべての AWS リソースを確認できます。
 
-```bash
+```console
 $ copilot env show --name test
 About
 
   Name              test
-  Production        false
   Region            us-west-2
   Account ID        693652174720
 
-Services
+Workloads
 
   Name              Type
   ----              ----

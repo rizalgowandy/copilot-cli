@@ -14,6 +14,7 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/addon"
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack/mocks"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
@@ -45,7 +46,13 @@ func TestScheduledJob_Template(t *testing.T) {
 		String:      nil,
 		StringSlice: []string{"world"},
 	}
-
+	testScheduledJobManifest.Network.VPC.Placement = manifest.PlacementArgOrString{
+		PlacementArgs: manifest.PlacementArgs{
+			Subnets: manifest.SubnetListOrArgs{
+				IDs: []string{"id1", "id2"},
+			},
+		},
+	}
 	testCases := map[string]struct {
 		mockDependencies func(t *testing.T, ctrl *gomock.Controller, j *ScheduledJob)
 
@@ -55,22 +62,26 @@ func TestScheduledJob_Template(t *testing.T) {
 		"render template without addons successfully": {
 			mockDependencies: func(t *testing.T, ctrl *gomock.Controller, j *ScheduledJob) {
 				m := mocks.NewMockscheduledJobReadParser(ctrl)
-				m.EXPECT().Read(envControllerPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().ParseScheduledJob(gomock.Eq(template.WorkloadOpts{
-					ScheduleExpression: "cron(0 0 * * ? *)",
-					StateMachine: &template.StateMachineOpts{
-						Timeout: aws.Int(5400),
-						Retries: aws.Int(3),
-					},
-					Network: template.NetworkOpts{
-						AssignPublicIP: template.EnablePublicIP,
-						SubnetsType:    template.PublicSubnetsPlacement,
-					},
-					EntryPoint:          []string{"/bin/echo", "hello"},
-					Command:             []string{"world"},
-					EnvControllerLambda: "something",
-				})).Return(&template.Content{Buffer: bytes.NewBufferString("template")}, nil)
-				addons := mockAddons{tplErr: &addon.ErrAddonsNotFound{}, paramsErr: &addon.ErrAddonsNotFound{}}
+				m.EXPECT().ParseScheduledJob(gomock.Any()).DoAndReturn(func(actual template.WorkloadOpts) (*template.Content, error) {
+					require.Equal(t, template.WorkloadOpts{
+						WorkloadType:       manifestinfo.ScheduledJobType,
+						ScheduleExpression: "cron(0 0 * * ? *)",
+						StateMachine: &template.StateMachineOpts{
+							Timeout: aws.Int(5400),
+							Retries: aws.Int(3),
+						},
+						Network: template.NetworkOpts{
+							AssignPublicIP: template.DisablePublicIP,
+							SubnetIDs:      []string{"id1", "id2"},
+							SecurityGroups: []template.SecurityGroup{},
+						},
+						EntryPoint:      []string{"/bin/echo", "hello"},
+						Command:         []string{"world"},
+						CustomResources: make(map[string]template.S3ObjectLocation),
+					}, actual)
+					return &template.Content{Buffer: bytes.NewBufferString("template")}, nil
+				})
+				addons := mockAddons{}
 				j.parser = m
 				j.wkld.addons = addons
 			},
@@ -79,29 +90,33 @@ func TestScheduledJob_Template(t *testing.T) {
 		"render template with addons": {
 			mockDependencies: func(t *testing.T, ctrl *gomock.Controller, j *ScheduledJob) {
 				m := mocks.NewMockscheduledJobReadParser(ctrl)
-				m.EXPECT().Read(envControllerPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().ParseScheduledJob(gomock.Eq(template.WorkloadOpts{
-					NestedStack: &template.WorkloadNestedStackOpts{
-						StackName:       addon.StackName,
-						VariableOutputs: []string{"Hello"},
-						SecretOutputs:   []string{"MySecretArn"},
-						PolicyOutputs:   []string{"AdditionalResourcesPolicyArn"},
-					},
-					AddonsExtraParams: `ServiceName: !GetAtt Service.Name
+				m.EXPECT().ParseScheduledJob(gomock.Any()).DoAndReturn(func(actual template.WorkloadOpts) (*template.Content, error) {
+					require.Equal(t, template.WorkloadOpts{
+						WorkloadType: manifestinfo.ScheduledJobType,
+						NestedStack: &template.WorkloadNestedStackOpts{
+							StackName:       addon.StackName,
+							VariableOutputs: []string{"Hello"},
+							SecretOutputs:   []string{"MySecretArn"},
+							PolicyOutputs:   []string{"AdditionalResourcesPolicyArn"},
+						},
+						AddonsExtraParams: `ServiceName: !GetAtt Service.Name
 DiscoveryServiceArn: !GetAtt DiscoveryService.Arn`,
-					ScheduleExpression: "cron(0 0 * * ? *)",
-					StateMachine: &template.StateMachineOpts{
-						Timeout: aws.Int(5400),
-						Retries: aws.Int(3),
-					},
-					Network: template.NetworkOpts{
-						AssignPublicIP: template.EnablePublicIP,
-						SubnetsType:    template.PublicSubnetsPlacement,
-					},
-					EntryPoint:          []string{"/bin/echo", "hello"},
-					Command:             []string{"world"},
-					EnvControllerLambda: "something",
-				})).Return(&template.Content{Buffer: bytes.NewBufferString("template")}, nil)
+						ScheduleExpression: "cron(0 0 * * ? *)",
+						StateMachine: &template.StateMachineOpts{
+							Timeout: aws.Int(5400),
+							Retries: aws.Int(3),
+						},
+						Network: template.NetworkOpts{
+							AssignPublicIP: template.DisablePublicIP,
+							SubnetIDs:      []string{"id1", "id2"},
+							SecurityGroups: []template.SecurityGroup{},
+						},
+						EntryPoint:      []string{"/bin/echo", "hello"},
+						Command:         []string{"world"},
+						CustomResources: make(map[string]template.S3ObjectLocation),
+					}, actual)
+					return &template.Content{Buffer: bytes.NewBufferString("template")}, nil
+				})
 				addons := mockAddons{
 					tpl: `Resources:
   AdditionalResourcesPolicy:
@@ -138,9 +153,7 @@ DiscoveryServiceArn: !GetAtt DiscoveryService.Arn`,
 		},
 		"error parsing addons": {
 			mockDependencies: func(t *testing.T, ctrl *gomock.Controller, j *ScheduledJob) {
-				m := mocks.NewMockscheduledJobReadParser(ctrl)
 				addons := mockAddons{tplErr: errors.New("some error")}
-				j.parser = m
 				j.wkld.addons = addons
 			},
 			wantedError: fmt.Errorf("generate addons template for %s: %w", aws.StringValue(testScheduledJobManifest.Name), errors.New("some error")),
@@ -148,9 +161,8 @@ DiscoveryServiceArn: !GetAtt DiscoveryService.Arn`,
 		"template parsing error": {
 			mockDependencies: func(t *testing.T, ctrl *gomock.Controller, j *ScheduledJob) {
 				m := mocks.NewMockscheduledJobReadParser(ctrl)
-				m.EXPECT().Read(envControllerPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
 				m.EXPECT().ParseScheduledJob(gomock.Any()).Return(nil, errors.New("some error"))
-				addons := mockAddons{tplErr: &addon.ErrAddonsNotFound{}}
+				addons := mockAddons{}
 				j.parser = m
 				j.wkld.addons = addons
 			},
@@ -169,9 +181,11 @@ DiscoveryServiceArn: !GetAtt DiscoveryService.Arn`,
 						env:  testJobEnvName,
 						app:  testJobAppName,
 						rc: RuntimeConfig{
-							Image: &ECRImage{
-								ImageTag: testJobImageTag,
-								RepoURL:  testJobImageRepoURL,
+							PushedImages: map[string]ECRImage{
+								"testServiceName": {
+									RepoURL:  testImageRepoURL,
+									ImageTag: testImageTag,
+								},
 							},
 							AccountID: "0123456789012",
 							Region:    "us-west-2",
@@ -182,7 +196,6 @@ DiscoveryServiceArn: !GetAtt DiscoveryService.Arn`,
 				manifest: testScheduledJobManifest,
 			}
 			tc.mockDependencies(t, ctrl, conf)
-
 			// WHEN
 			template, err := conf.Template()
 
@@ -307,6 +320,10 @@ func TestScheduledJob_awsSchedule(t *testing.T) {
 		"passthrough AWS flavored rate": {
 			inputSchedule:  "rate(5 minutes)",
 			wantedSchedule: "rate(5 minutes)",
+		},
+		"passthrough 'none' case": {
+			inputSchedule:  "none",
+			wantedSchedule: "none",
 		},
 	}
 	for name, tc := range testCases {
@@ -480,6 +497,10 @@ func TestScheduledJob_Parameters(t *testing.T) {
 			ParameterValue: aws.String(""),
 		},
 		{
+			ParameterKey:   aws.String(WorkloadArtifactKeyARNParamKey),
+			ParameterValue: aws.String(""),
+		},
+		{
 			ParameterKey:   aws.String(ScheduledJobScheduleParamKey),
 			ParameterValue: aws.String("cron(0 0 * * ? *)"),
 		},
@@ -508,9 +529,11 @@ func TestScheduledJob_Parameters(t *testing.T) {
 						env:  testEnvName,
 						app:  testAppName,
 						rc: RuntimeConfig{
-							Image: &ECRImage{
-								RepoURL:  testImageRepoURL,
-								ImageTag: testImageTag,
+							PushedImages: map[string]ECRImage{
+								"frontend": {
+									RepoURL:  testImageRepoURL,
+									ImageTag: testImageTag,
+								},
 							},
 						},
 					},
@@ -542,64 +565,51 @@ func TestScheduledJob_SerializedParameters(t *testing.T) {
 		Timeout:  "1h30m",
 		Retries:  3,
 	})
-	testCases := map[string]struct {
-		mockDependencies func(ctrl *gomock.Controller, c *ScheduledJob)
 
-		wantedParams string
-		wantedError  error
-	}{
-		"unavailable template": {
-			mockDependencies: func(ctrl *gomock.Controller, c *ScheduledJob) {
-				m := mocks.NewMockloadBalancedWebSvcReadParser(ctrl)
-				m.EXPECT().Parse(wkldParamsTemplatePath, gomock.Any(), gomock.Any()).Return(nil, errors.New("some error"))
-				c.wkld.parser = m
-			},
-			wantedParams: "",
-			wantedError:  errors.New("some error"),
-		},
-		"render params template": {
-			mockDependencies: func(ctrl *gomock.Controller, c *ScheduledJob) {
-				m := mocks.NewMockloadBalancedWebSvcReadParser(ctrl)
-				m.EXPECT().Parse(wkldParamsTemplatePath, gomock.Any(), gomock.Any()).Return(&template.Content{Buffer: bytes.NewBufferString("params")}, nil)
-				c.wkld.parser = m
-			},
-			wantedParams: "params",
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			// GIVEN
-			ctrl := gomock.NewController(t)
-			defer ctrl.Finish()
-			c := &ScheduledJob{
-				ecsWkld: &ecsWkld{
-					wkld: &wkld{
-						name: aws.StringValue(testScheduledJobManifest.Name),
-						env:  testEnvName,
-						app:  testAppName,
-						rc: RuntimeConfig{
-							Image: &ECRImage{
-								RepoURL:  testImageRepoURL,
-								ImageTag: testImageTag,
-							},
-							AdditionalTags: map[string]string{
-								"owner": "boss",
-							},
+	c := &ScheduledJob{
+		ecsWkld: &ecsWkld{
+			wkld: &wkld{
+				name: aws.StringValue(testScheduledJobManifest.Name),
+				env:  testEnvName,
+				app:  testAppName,
+				rc: RuntimeConfig{
+					PushedImages: map[string]ECRImage{
+						aws.StringValue(testScheduledJobManifest.Name): {
+							RepoURL:  testImageRepoURL,
+							ImageTag: testImageTag,
 						},
 					},
-					tc: testScheduledJobManifest.TaskConfig,
+					AdditionalTags: map[string]string{
+						"owner": "boss",
+					},
 				},
-				manifest: testScheduledJobManifest,
-			}
-			tc.mockDependencies(ctrl, c)
-
-			// WHEN
-			params, err := c.SerializedParameters()
-
-			// THEN
-			require.Equal(t, tc.wantedError, err)
-			require.Equal(t, tc.wantedParams, params)
-		})
+			},
+			tc: testScheduledJobManifest.TaskConfig,
+		},
+		manifest: testScheduledJobManifest,
 	}
+	params, err := c.SerializedParameters()
+	require.NoError(t, err)
+	require.Equal(t, params, `{
+  "Parameters": {
+    "AddonsTemplateURL": "",
+    "AppName": "phonetool",
+    "ArtifactKeyARN": "",
+    "ContainerImage": "111111111111.dkr.ecr.us-west-2.amazonaws.com/phonetool/frontend:manual-bf3678c",
+    "EnvFileARN": "",
+    "EnvName": "test",
+    "LogRetention": "30",
+    "Schedule": "cron(0 0 * * ? *)",
+    "TaskCPU": "256",
+    "TaskCount": "1",
+    "TaskMemory": "512",
+    "WorkloadName": "mailer"
+  },
+  "Tags": {
+    "copilot-application": "phonetool",
+    "copilot-environment": "test",
+    "copilot-service": "mailer",
+    "owner": "boss"
+  }
+}`)
 }

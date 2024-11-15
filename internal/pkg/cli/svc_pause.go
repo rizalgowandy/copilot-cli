@@ -10,13 +10,13 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 
 	"github.com/aws/copilot-cli/internal/pkg/aws/apprunner"
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/describe"
-	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
 	"github.com/aws/copilot-cli/internal/pkg/term/log"
 	termprogress "github.com/aws/copilot-cli/internal/pkg/term/progress"
@@ -86,24 +86,23 @@ func newSvcPauseOpts(vars svcPauseVars) (*svcPauseOpts, error) {
 		if err != nil {
 			return fmt.Errorf("get workload: %w", err)
 		}
-		if wl.Type != manifest.RequestDrivenWebServiceType {
-			return fmt.Errorf("pausing a service is only supported for services with type: %s", manifest.RequestDrivenWebServiceType)
+		if wl.Type != manifestinfo.RequestDrivenWebServiceType {
+			return fmt.Errorf("pausing a service is only supported for services with type: %s", manifestinfo.RequestDrivenWebServiceType)
 		}
 		sess, err := sessProvider.FromRole(env.ManagerRoleARN, env.Region)
 		if err != nil {
 			return err
 		}
 		opts.client = apprunner.New(sess)
-		d, err := describe.NewAppRunnerServiceDescriber(describe.NewServiceConfig{
+		d, err := describe.NewRDWebServiceDescriber(describe.NewServiceConfig{
 			App:         opts.appName,
-			Env:         opts.envName,
 			Svc:         opts.svcName,
 			ConfigStore: opts.store,
 		})
 		if err != nil {
 			return err
 		}
-		opts.svcARN, err = d.ServiceARN()
+		opts.svcARN, err = d.ServiceARN(opts.envName)
 		if err != nil {
 			return fmt.Errorf("retrieve ServiceARN for %s: %w", opts.svcName, err)
 		}
@@ -145,7 +144,7 @@ func (o *svcPauseOpts) validateOrAskApp() error {
 		_, err := o.store.GetApplication(o.appName)
 		return err
 	}
-	app, err := o.sel.Application(svcPauseAppNamePrompt, svcAppNameHelpPrompt)
+	app, err := o.sel.Application(svcPauseAppNamePrompt, wkldAppNameHelpPrompt)
 	if err != nil {
 		return fmt.Errorf("select application: %w", err)
 	}
@@ -173,13 +172,13 @@ func (o *svcPauseOpts) validateAndAskSvcEnvName() error {
 		svcPauseSvcNameHelpPrompt,
 		o.appName,
 		selector.WithEnv(o.envName),
-		selector.WithSvc(o.svcName),
-		selector.WithServiceTypesFilter([]string{manifest.RequestDrivenWebServiceType}),
+		selector.WithName(o.svcName),
+		selector.WithServiceTypesFilter([]string{manifestinfo.RequestDrivenWebServiceType}),
 	)
 	if err != nil {
 		return fmt.Errorf("select deployed services for application %s: %w", o.appName, err)
 	}
-	o.svcName = deployedService.Svc
+	o.svcName = deployedService.Name
 	o.envName = deployedService.Env
 	return nil
 }

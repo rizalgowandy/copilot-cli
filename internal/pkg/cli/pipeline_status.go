@@ -9,6 +9,7 @@ import (
 
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
+	"github.com/spf13/afero"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ssm"
@@ -43,20 +44,24 @@ type pipelineStatusVars struct {
 type pipelineStatusOpts struct {
 	pipelineStatusVars
 
-	w             io.Writer
-	ws            wsPipelineReader
-	store         store
-	codepipeline  pipelineGetter
-	describer     describer
-	sel           codePipelineSelector
-	prompt        prompter
-	initDescriber func(opts *pipelineStatusOpts) error
+	w                      io.Writer
+	ws                     wsPipelineReader
+	store                  store
+	codepipeline           pipelineGetter
+	describer              describer
+	sel                    codePipelineSelector
+	prompt                 prompter
+	initDescriber          func(opts *pipelineStatusOpts) error
+	deployedPipelineLister deployedPipelineLister
+
+	// Cached variables.
+	targetPipeline *deploy.Pipeline
 }
 
 func newPipelineStatusOpts(vars pipelineStatusVars) (*pipelineStatusOpts, error) {
-	ws, err := workspace.New()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
-		return nil, fmt.Errorf("new workspace client: %w", err)
+		return nil, err
 	}
 
 	session, err := sessions.ImmutableProvider(sessions.UserAgentExtras("pipeline status")).Default()
@@ -64,19 +69,24 @@ func newPipelineStatusOpts(vars pipelineStatusVars) (*pipelineStatusOpts, error)
 		return nil, fmt.Errorf("session: %w", err)
 	}
 	codepipeline := codepipeline.New(session)
-	pipelineLister := deploy.NewPipelineStore(vars.appName, rg.New(session))
+	pipelineLister := deploy.NewPipelineStore(rg.New(session))
 	store := config.NewSSMStore(identity.New(session), ssm.New(session), aws.StringValue(session.Config.Region))
 	prompter := prompt.New()
 	return &pipelineStatusOpts{
-		w:                  log.OutputWriter,
-		pipelineStatusVars: vars,
-		ws:                 ws,
-		store:              store,
-		codepipeline:       codepipeline,
-		sel:                selector.NewAppPipelineSelect(prompter, store, pipelineLister),
-		prompt:             prompter,
+		w:                      log.OutputWriter,
+		pipelineStatusVars:     vars,
+		ws:                     ws,
+		store:                  store,
+		codepipeline:           codepipeline,
+		deployedPipelineLister: pipelineLister,
+		sel:                    selector.NewAppPipelineSelector(prompter, store, pipelineLister),
+		prompt:                 prompter,
 		initDescriber: func(o *pipelineStatusOpts) error {
-			d, err := describe.NewPipelineStatusDescriber(o.name)
+			pipeline, err := o.getTargetPipeline()
+			if err != nil {
+				return err
+			}
+			d, err := describe.NewPipelineStatusDescriber(pipeline)
 			if err != nil {
 				return fmt.Errorf("new pipeline status describer: %w", err)
 			}
@@ -103,17 +113,17 @@ func (o *pipelineStatusOpts) Ask() error {
 		}
 	}
 	if o.name != "" {
-		_, err := o.codepipeline.GetPipeline(o.name)
-		if err != nil {
+		if _, err := o.getTargetPipeline(); err != nil {
 			return fmt.Errorf("validate pipeline name %s: %w", o.name, err)
 		}
 		return nil
 	}
-	pipelineName, err := askDeployedPipelineName(o.sel, o.appName, fmt.Sprintf(fmtpipelineStatusPrompt, color.HighlightUserInput(o.appName)))
+	pipeline, err := askDeployedPipelineName(o.sel, fmt.Sprintf(fmtpipelineStatusPrompt, color.HighlightUserInput(o.appName)), o.appName)
 	if err != nil {
 		return err
 	}
-	o.name = pipelineName
+	o.name = pipeline.Name
+	o.targetPipeline = &pipeline
 	return nil
 }
 
@@ -141,6 +151,18 @@ func (o *pipelineStatusOpts) Execute() error {
 	return nil
 }
 
+func (o *pipelineStatusOpts) getTargetPipeline() (deploy.Pipeline, error) {
+	if o.targetPipeline != nil {
+		return *o.targetPipeline, nil
+	}
+	pipeline, err := getDeployedPipelineInfo(o.deployedPipelineLister, o.appName, o.name)
+	if err != nil {
+		return deploy.Pipeline{}, err
+	}
+	o.targetPipeline = &pipeline
+	return pipeline, nil
+}
+
 func (o *pipelineStatusOpts) askAppName() error {
 	name, err := o.sel.Application(pipelineStatusAppNamePrompt, pipelineStatusAppNameHelpPrompt)
 	if err != nil {
@@ -159,8 +181,8 @@ func buildPipelineStatusCmd() *cobra.Command {
 		Long:  "Shows the status of each stage of your pipeline.",
 
 		Example: `
-Shows status of the pipeline "pipeline-myapp-myrepo".
-/code $ copilot pipeline status -n pipeline-myapp-myrepo`,
+Shows status of the pipeline "my-repo-my-branch".
+/code $ copilot pipeline status -n my-repo-my-branch`,
 		RunE: runCmdE(func(cmd *cobra.Command, args []string) error {
 			opts, err := newPipelineStatusOpts(vars)
 			if err != nil {

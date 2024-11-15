@@ -72,9 +72,9 @@ func newTaskExecOpts(vars taskExecVars) (*taskExecOpts, error) {
 		ssmPluginManager: exec.NewSSMPluginCommand(nil),
 		prompter:         prompter,
 		newTaskSel: func(sess *session.Session) runningTaskSelector {
-			return selector.NewTaskSelect(prompter, ecs.New(sess))
+			return selector.NewTaskSelector(prompter, ecs.New(sess))
 		},
-		configSel: selector.NewConfigSelect(prompter, ssmStore),
+		configSel: selector.NewConfigSelector(prompter, ssmStore),
 		newCommandExecutor: func(s *session.Session) ecsCommandExecutor {
 			return awsecs.New(s)
 		},
@@ -117,7 +117,7 @@ func (o *taskExecOpts) Ask() error {
 		o.appName = appName
 	}
 	if o.envName == "" {
-		envName, err := o.configSel.Environment(taskExecEnvNamePrompt, taskExecEnvNameHelpPrompt, o.appName, useDefaultClusterOption)
+		envName, err := o.configSel.Environment(taskExecEnvNamePrompt, taskExecEnvNameHelpPrompt, o.appName, prompt.Option{Value: useDefaultClusterOption})
 		if err != nil {
 			return fmt.Errorf("select environment: %w", err)
 		}

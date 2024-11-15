@@ -6,6 +6,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -92,7 +93,7 @@ func TestSecretInitOpts_Validate(t *testing.T) {
 		"invalid input file name": {
 			inInputFilePath: "weird/path/to/secrets",
 			setupMocks:      func(m secretInitMocks) {},
-			wantedError:     errors.New("open weird/path/to/secrets: file does not exist"),
+			wantedError:     fmt.Errorf("open %s: file does not exist", filepath.FromSlash("weird/path/to/secrets")),
 		},
 		"error if input file name is specified with name": {
 			inName:          "db-password",
@@ -341,9 +342,9 @@ func TestSecretInitOpts_Ask(t *testing.T) {
 }
 
 type secretInitExecuteMocks struct {
-	mockStore        *mocks.Mockstore
-	mockSecretPutter *mocks.MocksecretPutter
-	mockEnvUpgrader  *mocks.MockactionCommand
+	mockStore                   *mocks.Mockstore
+	mockSecretPutter            *mocks.MocksecretPutter
+	mockEnvCompatibilityChecker *mocks.MockversionCompatibilityChecker
 }
 
 func TestSecretInitOpts_Execute(t *testing.T) {
@@ -398,7 +399,7 @@ func TestSecretInitOpts_Execute(t *testing.T) {
 				}).Return(&ssm.PutSecretOutput{
 					Version: aws.Int64(1),
 				}, nil)
-				m.mockEnvUpgrader.EXPECT().Execute().Return(nil).Times(2)
+				m.mockEnvCompatibilityChecker.EXPECT().Version().Return("v1.10.0", nil).Times(2)
 			},
 		},
 		"should make calls to overwrite if overwrite is specified": {
@@ -430,7 +431,7 @@ func TestSecretInitOpts_Execute(t *testing.T) {
 				}).Return(&ssm.PutSecretOutput{
 					Version: aws.Int64(1),
 				}, nil)
-				m.mockEnvUpgrader.EXPECT().Execute().Return(nil).Times(2)
+				m.mockEnvCompatibilityChecker.EXPECT().Version().Return("v1.10.0", nil).Times(2)
 			},
 		},
 		"do not throw error if parameter already exists": {
@@ -459,7 +460,7 @@ func TestSecretInitOpts_Execute(t *testing.T) {
 				}).Return(&ssm.PutSecretOutput{
 					Version: aws.Int64(1),
 				}, nil)
-				m.mockEnvUpgrader.EXPECT().Execute().Return(nil).Times(2)
+				m.mockEnvCompatibilityChecker.EXPECT().Version().Return("v1.10.0", nil).Times(2)
 			},
 		},
 		"a secret fails to create in some environments": {
@@ -488,7 +489,7 @@ func TestSecretInitOpts_Execute(t *testing.T) {
 				}).Return(&ssm.PutSecretOutput{
 					Version: aws.Int64(1),
 				}, nil)
-				m.mockEnvUpgrader.EXPECT().Execute().Return(nil).Times(2)
+				m.mockEnvCompatibilityChecker.EXPECT().Version().Return("v1.10.0", nil).Times(2)
 			},
 
 			wantedError: &errSecretFailedInSomeEnvironments{
@@ -537,7 +538,7 @@ db-host:
 						deploy.EnvTagKey: "test",
 					},
 				}).Return(nil, errors.New("some error for db-host in test"))
-				m.mockEnvUpgrader.EXPECT().Execute().Return(nil).Times(2)
+				m.mockEnvCompatibilityChecker.EXPECT().Version().Return("v1.10.0", nil).Times(2)
 			},
 
 			wantedError: &errBatchPutSecretsFailed{
@@ -565,9 +566,9 @@ db-host:
 			defer ctrl.Finish()
 
 			m := secretInitExecuteMocks{
-				mockStore:        mocks.NewMockstore(ctrl),
-				mockSecretPutter: mocks.NewMocksecretPutter(ctrl),
-				mockEnvUpgrader:  mocks.NewMockactionCommand(ctrl),
+				mockStore:                   mocks.NewMockstore(ctrl),
+				mockSecretPutter:            mocks.NewMocksecretPutter(ctrl),
+				mockEnvCompatibilityChecker: mocks.NewMockversionCompatibilityChecker(ctrl),
 			}
 			tc.setupMocks(m)
 
@@ -581,8 +582,8 @@ db-host:
 				},
 				store: m.mockStore,
 
-				secretPutters:  make(map[string]secretPutter),
-				envUpgradeCMDs: make(map[string]actionCommand),
+				secretPutters:           make(map[string]secretPutter),
+				envCompatibilityChecker: make(map[string]versionCompatibilityChecker),
 				readFile: func() ([]byte, error) {
 					return tc.mockInputFileContent, nil
 				},
@@ -590,7 +591,7 @@ db-host:
 
 			opts.configureClientsForEnv = func(envName string) error {
 				opts.secretPutters[envName] = m.mockSecretPutter
-				opts.envUpgradeCMDs[envName] = m.mockEnvUpgrader
+				opts.envCompatibilityChecker[envName] = m.mockEnvCompatibilityChecker
 				return nil
 			}
 

@@ -2,6 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 AWSTemplateFormatVersion: 2010-09-09
 Description: CloudFormation template that represents a request driven web service on AWS App Runner.
+Metadata:
+  Version: {{ .Version }}
+{{- if .SerializedManifest }}
+  Manifest: |
+{{indent 4 .SerializedManifest}}
+{{- end }}
 Parameters:
   AppName:
     Type: String
@@ -38,6 +44,9 @@ Parameters:
     Description: 'URL of the addons nested stack template within the S3 bucket.'
     Type: String
     Default: ''
+  ArtifactKeyARN:
+    Type: String
+    Description: 'KMS Key used for encrypting artifacts'
 
 Conditions:
   # App Runner will not accept an AccessRole for ImageRepositoryTypes other than ECR.
@@ -77,6 +86,25 @@ Resources:
           ImageRepositoryType: !Ref ImageRepositoryType
           ImageConfiguration:
             Port: !Ref ContainerPort
+            {{- if hasSecrets .}}
+            RuntimeEnvironmentSecrets:
+            {{- range $name, $secret := .Secrets}}
+              - Name: {{$name}}
+            {{- if $secret.RequiresImport}}
+                Value:
+                  Fn::ImportValue: {{ quote $secret.ValueFrom }}
+            {{- else}}
+                Value: {{if not $secret.RequiresSub }} {{$secret.ValueFrom}} {{- else}} !Sub 'arn:${AWS::Partition}:{{$secret.Service}}:${AWS::Region}:${AWS::AccountId}:{{$secret.ValueFrom}}' {{- end}}
+            {{- end}}   
+            {{- end}}
+            {{- end}}
+            {{- if .NestedStack}}{{$stackName := .NestedStack.StackName}}
+            {{- range $secret := .NestedStack.SecretOutputs}}
+              - Name: {{toSnakeCase $secret}}
+                Value:
+                  Fn::GetAtt: [{{$stackName}}, Outputs.{{$secret}}]
+            {{- end}}
+            {{- end}}
             RuntimeEnvironmentVariables:
               - Name: COPILOT_APPLICATION_NAME
                 Value: !Ref AppName
@@ -84,7 +112,7 @@ Resources:
                 Value: !Ref EnvName
               - Name: COPILOT_SERVICE_NAME
                 Value: !Ref WorkloadName
-{{- if eq .Network.SubnetsType "PrivateSubnets"}}
+{{- if requiresVPCConnector .}}
               - Name: COPILOT_SERVICE_DISCOVERY_ENDPOINT
                 Value: {{.ServiceDiscoveryEndpoint}}
 {{- end}}
@@ -95,10 +123,7 @@ Resources:
               {{- end }}
               {{- end }}
               {{- if .Variables}}
-              {{- range $name, $value := .Variables}}
-              - Name: {{$name}}
-                Value: {{$value | printf "%q"}}
-              {{- end}}
+              {{include "variables" . | indent 14}}
               {{- end}}
               {{- if .NestedStack}}{{$stackName := .NestedStack.StackName}}
               {{- range $var := .NestedStack.VariableOutputs}}
@@ -128,17 +153,26 @@ Resources:
         HealthyThreshold: !If [HasHealthCheckHealthyThreshold, !Ref HealthCheckHealthyThreshold, !Ref AWS::NoValue]
         UnhealthyThreshold: !If [HasHealthCheckUnhealthyThreshold, !Ref HealthCheckUnhealthyThreshold, !Ref AWS::NoValue]
       {{- end }}
-      {{- if eq .Network.SubnetsType "PrivateSubnets"}}
       NetworkConfiguration:
         EgressConfiguration:
+          {{- if requiresVPCConnector .}}
           EgressType: VPC
           VpcConnectorArn: !Ref VpcConnector
-      {{- end }}
-      {{- if and (contains .FeatureFlags "Tracing") (eq .Observability.Tracing "AWSXRAY")}}
+          {{- else }}
+          EgressType: DEFAULT
+          {{- end}}
+        {{- if .Private}}
+        IngressConfiguration:
+          IsPubliclyAccessible: false
+        {{- end}}
+      {{- if eq .Observability.Tracing "AWSXRAY"}}
       ObservabilityConfiguration:
         ObservabilityEnabled: true
         ObservabilityConfigurationArn: !Sub 'arn:aws:apprunner:${AWS::Region}:${AWS::AccountId}:observabilityconfiguration/DefaultConfiguration/1/00000000000000000000000000000001'
       {{- end }}
+      {{- if .Count}}   
+      AutoScalingConfigurationArn: !Sub 'arn:${AWS::Partition}:apprunner:${AWS::Region}:${AWS::AccountId}:autoscalingconfiguration/{{.Count}}'
+      {{- end}}
       Tags:
         - Key: copilot-application
           Value: !Ref AppName
@@ -149,19 +183,51 @@ Resources:
         - Key: {{$name}}
           Value: {{$value}}{{end}}{{end}}
 
+  {{- if .Private}}
+  AppRunnerVpcIngressConnection:
+    Metadata:
+      'aws:copilot:description': 'The ingress connection from your environment to this service'
+    Type: AWS::AppRunner::VpcIngressConnection
+    Properties:
+      ServiceArn: !GetAtt Service.ServiceArn
+      IngressVpcConfiguration:
+        VpcId:
+          Fn::ImportValue: !Sub '${AppName}-${EnvName}-VpcId'
+        {{- if .AppRunnerVPCEndpoint}}
+        VpcEndpointId: {{.AppRunnerVPCEndpoint}}
+        {{- else}}
+        VpcEndpointId: !GetAtt EnvControllerAction.AppRunnerVpcEndpointId
+        {{- end}}
+      Tags:
+        - Key: copilot-application
+          Value: !Ref AppName
+        - Key: copilot-environment
+          Value: !Ref EnvName
+        - Key: copilot-service
+          Value: !Ref WorkloadName
+        {{- if .Tags}}
+        {{- range $name, $value := .Tags}}
+        - Key: {{$name}}
+          Value: {{$value}}
+        {{- end}}
+        {{- end}}
+  {{- end}}
+
 {{include "addons" . | indent 2}}
 {{if .Alias}}
   CustomDomainFunction:
     Type: AWS::Lambda::Function
     Properties:
+      {{- with $cr := index .CustomResources "CustomDomainFunction" }}
       Code:
-        S3Bucket: {{ .ScriptBucketName }}
-        S3Key: {{ .CustomDomainLambda }}
+        S3Bucket: {{$cr.Bucket}}
+        S3Key: {{$cr.Key}}
+      {{- end }}
       Handler: "index.handler"
       Timeout: 900
       MemorySize: 512
       Role: !GetAtt CustomResourceRole.Arn
-      Runtime: nodejs14.x
+      Runtime: nodejs20.x
       Layers:
         - {{ .AWSSDKLayer }}
 
@@ -178,10 +244,12 @@ Resources:
       AppDNSName: {{ .AppDNSName }}
 
   CustomResourceRole:
+    Metadata:
+      'aws:copilot:description': 'An IAM role {{- if .PermissionsBoundary}} with permissions boundary {{.PermissionsBoundary}} {{- end}} used by custom resources to associate the custom domain'
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
           -
             Effect: Allow
@@ -190,6 +258,9 @@ Resources:
                 - lambda.amazonaws.com
             Action:
               - sts:AssumeRole
+      {{- if .PermissionsBoundary}}
+      PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/{{.PermissionsBoundary}}'
+      {{- end}}
       Path: /
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
@@ -211,10 +282,10 @@ Resources:
 {{- end }}
 {{include "publish" . | indent 2}}
 
-{{- if ne .EnvControllerLambda ""}}
+{{- if gt (len (envControllerParams .)) 0}}
 {{include "env-controller" . | indent 2}}
 {{- end}}
 
-{{- if eq .Network.SubnetsType "PrivateSubnets"}}
+{{- if requiresVPCConnector .}}
 {{include "vpc-connector" . | indent 2 }}
 {{- end }}

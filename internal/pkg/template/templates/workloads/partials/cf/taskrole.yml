@@ -1,32 +1,28 @@
 TaskRole:
   Metadata:
-    'aws:copilot:description': 'An IAM role to control permissions for the containers in your tasks'
+    'aws:copilot:description': 'An IAM role {{- if .PermissionsBoundary}} with permissions boundary {{.PermissionsBoundary}} {{- end}} to control permissions for the containers in your tasks'
   Type: AWS::IAM::Role
   Properties:{{if .NestedStack}}{{$stackName := .NestedStack.StackName}}{{if gt (len .NestedStack.PolicyOutputs) 0}}
     ManagedPolicyArns:{{range $managedPolicy := .NestedStack.PolicyOutputs}}
-    - Fn::GetAtt: [{{$stackName}}, Outputs.{{$managedPolicy}}]{{end}}{{end}}{{end}}
+      - Fn::GetAtt: [{{$stackName}}, Outputs.{{$managedPolicy}}]{{end}}{{end}}{{end}}
+    {{- if .PermissionsBoundary}}
+    PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/{{.PermissionsBoundary}}'
+    {{- end}}
     AssumeRolePolicyDocument:
+      Version: '2012-10-17'
       Statement:
         - Effect: Allow
           Principal:
             Service: ecs-tasks.amazonaws.com
           Action: 'sts:AssumeRole'
     Policies:
-      - PolicyName: 'DenyIAMExceptTaggedRoles'
+      - PolicyName: 'DenyIAM'
         PolicyDocument:
           Version: '2012-10-17'
           Statement:
             - Effect: 'Deny'
               Action: 'iam:*'
               Resource: '*'
-            - Effect: 'Allow'
-              Action: 'sts:AssumeRole'
-              Resource:
-                - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
-              Condition:
-                StringEquals:
-                  'iam:ResourceTag/copilot-application': !Sub '${AppName}'
-                  'iam:ResourceTag/copilot-environment': !Sub '${EnvName}'
       {{- if .ExecuteCommand }}
       - PolicyName: 'ExecuteCommand'
         PolicyDocument:
@@ -50,8 +46,12 @@ TaskRole:
               Resource: "*"
       {{- end }}
       {{- if .Storage}}
-      {{- range $EFS := .Storage.EFSPerms}}
-      - PolicyName: 'GrantEFSAccess{{$EFS.FilesystemID}}'
+      {{- range $i, $EFS := .Storage.EFSPerms}}
+      {{- if not $EFS.FilesystemID.RequiresImport}}
+      - PolicyName: 'GrantEFSAccess{{$EFS.FilesystemID.Value}}-{{$i}}'
+      {{- else}}
+      - PolicyName: !Join ['',[ 'GrantEFSAccess', !ImportValue {{$EFS.FilesystemID.Value}}, '-{{$i}}']]
+      {{- end}}
         PolicyDocument: 
           Version: '2012-10-17'
           Statement:
@@ -67,7 +67,11 @@ TaskRole:
                   'elasticfilesystem:AccessPointArn': !Sub 'arn:${AWS::Partition}:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:access-point/{{$EFS.AccessPointID}}'
               {{- end}}
               Resource:
+              {{- if not $EFS.FilesystemID.RequiresImport}}
                 - !Sub 'arn:${AWS::Partition}:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/{{$EFS.FilesystemID}}'
+              {{- else}}
+                - !Join ['/',[!Sub 'arn:${AWS::Partition}:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system',!ImportValue {{$EFS.FilesystemID.Value}}]]
+              {{- end}}
       {{- end}}
       {{- if .Storage.ManagedVolumeInfo}}
       - PolicyName: 'GrantAccessCopilotManagedEFS'
@@ -102,5 +106,22 @@ TaskRole:
                 - !Ref {{logicalIDSafe $topic.Name}}SNSTopic
               {{- end}}
       {{- end}}{{- end}}
-
-
+      {{- if eq .Observability.Tracing "AWSXRAY"}}
+      - PolicyName: 'AWSDistroOpenTelemetryPolicy' 
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: 'Allow'
+              Action:
+                - 'logs:PutLogEvents'
+                - 'logs:CreateLogGroup'
+                - 'logs:CreateLogStream'
+                - 'logs:DescribeLogStreams'
+                - 'logs:DescribeLogGroups'
+                - 'xray:PutTraceSegments'
+                - 'xray:PutTelemetryRecords'
+                - 'xray:GetSamplingRules'
+                - 'xray:GetSamplingTargets'
+                - 'xray:GetSamplingStatisticSummaries'
+              Resource: "*"
+      {{- end}}

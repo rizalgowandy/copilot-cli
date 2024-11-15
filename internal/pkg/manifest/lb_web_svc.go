@@ -4,14 +4,17 @@
 package manifest
 
 import (
-	"errors"
-	"strings"
+	"maps"
+	"strconv"
 	"time"
+
+	"github.com/aws/copilot-cli/internal/pkg/term/color"
+	"github.com/aws/copilot-cli/internal/pkg/term/log"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/imdario/mergo"
-	"gopkg.in/yaml.v3"
 
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 	"github.com/aws/copilot-cli/internal/pkg/template"
 )
 
@@ -22,15 +25,14 @@ const (
 // Default values for HTTPHealthCheck for a load balanced web service.
 const (
 	DefaultHealthCheckPath        = "/"
+	DefaultHealthCheckAdminPath   = "admin"
 	DefaultHealthCheckGracePeriod = 60
+	DefaultDeregistrationDelay    = 60
 )
 
 const (
-	GRPCProtocol = "gRPC" // GRPCProtocol is the HTTP protocol version for gRPC.
-)
-
-var (
-	errUnmarshalHealthCheckArgs = errors.New("can't unmarshal healthcheck field into string or compose-style map")
+	GRPCProtocol   = "gRPC" // GRPCProtocol is the HTTP protocol version for gRPC.
+	commonGRPCPort = uint16(50051)
 )
 
 // durationp is a utility function used to convert a time.Duration to a pointer. Useful for YAML unmarshaling
@@ -46,15 +48,14 @@ type LoadBalancedWebService struct {
 	LoadBalancedWebServiceConfig `yaml:",inline"`
 	// Use *LoadBalancedWebServiceConfig because of https://github.com/imdario/mergo/issues/146
 	Environments map[string]*LoadBalancedWebServiceConfig `yaml:",flow"` // Fields to override per environment.
-
-	parser template.Parser
+	parser       template.Parser
 }
 
 // LoadBalancedWebServiceConfig holds the configuration for a load balanced web service.
 type LoadBalancedWebServiceConfig struct {
 	ImageConfig      ImageWithPortAndHealthcheck `yaml:"image,flow"`
 	ImageOverride    `yaml:",inline"`
-	RoutingRule      RoutingRuleConfigOrBool `yaml:"http,flow"`
+	HTTPOrBool       HTTPOrBool `yaml:"http,flow"`
 	TaskConfig       `yaml:",inline"`
 	Logging          `yaml:"logging,flow"`
 	Sidecars         map[string]*SidecarConfig        `yaml:"sidecars"` // NOTE: keep the pointers because `mergo` doesn't automatically deep merge map's value unless it's a pointer type.
@@ -62,6 +63,8 @@ type LoadBalancedWebServiceConfig struct {
 	PublishConfig    PublishConfig                    `yaml:"publish"`
 	TaskDefOverrides []OverrideRule                   `yaml:"taskdef_overrides"`
 	NLBConfig        NetworkLoadBalancerConfiguration `yaml:"nlb"`
+	DeployConfig     DeploymentConfig                 `yaml:"deployment"`
+	Observability    Observability                    `yaml:"observability"`
 }
 
 // LoadBalancedWebServiceProps contains properties for creating a new load balanced fargate service manifest.
@@ -70,7 +73,6 @@ type LoadBalancedWebServiceProps struct {
 	Path string
 	Port uint16
 
-	HTTPVersion string               // Optional http protocol version such as gRPC, HTTP2.
 	HealthCheck ContainerHealthCheck // Optional healthcheck configuration.
 	Platform    PlatformArgsOrString // Optional platform configuration.
 }
@@ -90,21 +92,37 @@ func NewLoadBalancedWebService(props *LoadBalancedWebServiceProps) *LoadBalanced
 		svc.LoadBalancedWebServiceConfig.TaskConfig.CPU = aws.Int(MinWindowsTaskCPU)
 		svc.LoadBalancedWebServiceConfig.TaskConfig.Memory = aws.Int(MinWindowsTaskMemory)
 	}
-	if props.HTTPVersion != "" {
-		svc.RoutingRule.ProtocolVersion = &props.HTTPVersion
+
+	if props.Port == commonGRPCPort {
+		log.Infof("Detected port %s, setting HTTP protocol version to %s in the manifest.\n",
+			color.HighlightUserInput(strconv.Itoa(int(props.Port))), color.HighlightCode(GRPCProtocol))
+		svc.HTTPOrBool.Main.ProtocolVersion = aws.String(GRPCProtocol)
 	}
-	svc.RoutingRule.Path = aws.String(props.Path)
+	svc.HTTPOrBool.Main.Path = aws.String(props.Path)
 	svc.parser = template.New()
+	for _, envName := range props.PrivateOnlyEnvironments {
+		svc.Environments[envName] = &LoadBalancedWebServiceConfig{
+			Network: NetworkConfig{
+				VPC: vpcConfig{
+					Placement: PlacementArgOrString{
+						PlacementString: placementStringP(PrivateSubnetPlacement),
+					},
+				},
+			},
+		}
+	}
 	return svc
 }
 
 // newDefaultHTTPLoadBalancedWebService returns an empty LoadBalancedWebService with only the default values set, including default HTTP configurations.
 func newDefaultHTTPLoadBalancedWebService() *LoadBalancedWebService {
 	lbws := newDefaultLoadBalancedWebService()
-	lbws.RoutingRule = RoutingRuleConfigOrBool{
-		RoutingRuleConfiguration: RoutingRuleConfiguration{
-			HealthCheck: HealthCheckArgsOrString{
-				HealthCheckPath: aws.String(DefaultHealthCheckPath),
+	lbws.HTTPOrBool = HTTPOrBool{
+		HTTP: HTTP{
+			Main: RoutingRule{
+				HealthCheck: HealthCheckArgsOrString{
+					Union: BasicToUnion[string, HTTPHealthCheckArgs](DefaultHealthCheckPath),
+				},
 			},
 		},
 	}
@@ -115,7 +133,7 @@ func newDefaultHTTPLoadBalancedWebService() *LoadBalancedWebService {
 func newDefaultLoadBalancedWebService() *LoadBalancedWebService {
 	return &LoadBalancedWebService{
 		Workload: Workload{
-			Type: aws.String(LoadBalancedWebServiceType),
+			Type: aws.String(manifestinfo.LoadBalancedWebServiceType),
 		},
 		LoadBalancedWebServiceConfig: LoadBalancedWebServiceConfig{
 			ImageConfig: ImageWithPortAndHealthcheck{},
@@ -125,7 +143,7 @@ func newDefaultLoadBalancedWebService() *LoadBalancedWebService {
 				Count: Count{
 					Value: aws.Int(1),
 					AdvancedCount: AdvancedCount{ // Leave advanced count empty while passing down the type of the workload.
-						workloadType: LoadBalancedWebServiceType,
+						workloadType: manifestinfo.LoadBalancedWebServiceType,
 					},
 				},
 				ExecuteCommand: ExecuteCommand{
@@ -134,10 +152,13 @@ func newDefaultLoadBalancedWebService() *LoadBalancedWebService {
 			},
 			Network: NetworkConfig{
 				VPC: vpcConfig{
-					Placement: placementP(PublicSubnetPlacement),
+					Placement: PlacementArgOrString{
+						PlacementString: placementStringP(PublicSubnetPlacement),
+					},
 				},
 			},
 		},
+		Environments: map[string]*LoadBalancedWebServiceConfig{},
 	}
 }
 
@@ -151,6 +172,21 @@ func (s *LoadBalancedWebService) MarshalBinary() ([]byte, error) {
 	return content.Bytes(), nil
 }
 
+func (s *LoadBalancedWebService) requiredEnvironmentFeatures() []string {
+	var features []string
+	if !s.HTTPOrBool.Disabled() {
+		features = append(features, template.ALBFeatureName)
+	}
+	features = append(features, s.Network.requiredEnvFeatures()...)
+	features = append(features, s.Storage.requiredEnvFeatures()...)
+	return features
+}
+
+// Dockerfile returns the relative path of the Dockerfile in the manifest.
+func (s *LoadBalancedWebService) Dockerfile() string {
+	return s.ImageConfig.Image.dockerfilePath()
+}
+
 // Port returns the exposed port in the manifest.
 // A LoadBalancedWebService always has a port exposed therefore the boolean is always true.
 func (s *LoadBalancedWebService) Port() (port uint16, ok bool) {
@@ -159,32 +195,41 @@ func (s *LoadBalancedWebService) Port() (port uint16, ok bool) {
 
 // Publish returns the list of topics where notifications can be published.
 func (s *LoadBalancedWebService) Publish() []Topic {
-	return s.LoadBalancedWebServiceConfig.PublishConfig.Topics
+	return s.LoadBalancedWebServiceConfig.PublishConfig.publishedTopics()
 }
 
-// BuildRequired returns if the service requires building from the local Dockerfile.
-func (s *LoadBalancedWebService) BuildRequired() (bool, error) {
-	return requiresBuild(s.ImageConfig.Image)
+// BuildArgs returns a docker.BuildArguments object given a context directory.
+func (s *LoadBalancedWebService) BuildArgs(contextDir string) (map[string]*DockerBuildArgs, error) {
+	required, err := requiresBuild(s.ImageConfig.Image)
+	if err != nil {
+		return nil, err
+	}
+	// Creating an map to store buildArgs of all sidecar images and main container image.
+	buildArgsPerContainer := make(map[string]*DockerBuildArgs, len(s.Sidecars)+1)
+	if required {
+		buildArgsPerContainer[aws.StringValue(s.Name)] = s.ImageConfig.Image.BuildConfig(contextDir)
+	}
+	return buildArgs(contextDir, buildArgsPerContainer, s.Sidecars)
 }
 
-// BuildArgs returns a docker.BuildArguments object given a ws root directory.
-func (s *LoadBalancedWebService) BuildArgs(wsRoot string) *DockerBuildArgs {
-	return s.ImageConfig.Image.BuildConfig(wsRoot)
+// EnvFiles returns the locations of all env files against the ws root directory.
+// This method returns a map[string]string where the keys are container names
+// and the values are either env file paths or empty strings.
+func (s *LoadBalancedWebService) EnvFiles() map[string]string {
+	return envFiles(s.Name, s.TaskConfig, s.Logging, s.Sidecars)
 }
 
-// EnvFile returns the location of the env file against the ws root directory.
-func (s *LoadBalancedWebService) EnvFile() string {
-	return aws.StringValue(s.TaskConfig.EnvFile)
+// ContainerDependencies returns a map of ContainerDependency objects for the LoadBalancedWebService
+// including dependencies for its main container, any logging sidecar, and additional sidecars.
+func (s *LoadBalancedWebService) ContainerDependencies() map[string]ContainerDependency {
+	return containerDependencies(aws.StringValue(s.Name), s.ImageConfig.Image, s.Logging, s.Sidecars)
 }
 
-// HasAliases returns true if the Load-Balanced Web Service uses aliases, either for ALB or NLB.
-func (s *LoadBalancedWebService) HasAliases() bool {
-	return !s.RoutingRule.Alias.IsEmpty() || !s.NLBConfig.Aliases.IsEmpty()
+func (s *LoadBalancedWebService) subnets() *SubnetListOrArgs {
+	return &s.Network.VPC.Placement.Subnets
 }
 
-// ApplyEnv returns the service manifest with environment overrides.
-// If the environment passed in does not have any overrides then it returns itself.
-func (s LoadBalancedWebService) ApplyEnv(envName string) (WorkloadManifest, error) {
+func (s LoadBalancedWebService) applyEnv(envName string) (workloadManifest, error) {
 	overrideConfig, ok := s.Environments[envName]
 	if !ok {
 		return &s, nil
@@ -204,126 +249,105 @@ func (s LoadBalancedWebService) ApplyEnv(envName string) (WorkloadManifest, erro
 			return nil, err
 		}
 	}
-
 	s.Environments = nil
 	return &s, nil
 }
 
-// RoutingRuleConfigOrBool holds advanced configuration for routing rule or a boolean switch.
-type RoutingRuleConfigOrBool struct {
-	RoutingRuleConfiguration
-	Enabled *bool
-}
-
-// Disabled returns true if the routing rule configuration is explicitly disabled.
-func (r *RoutingRuleConfigOrBool) Disabled() bool {
-	return r.Enabled != nil && !aws.BoolValue(r.Enabled)
-}
-
-// UnmarshalYAML implements the yaml(v3) interface. It allows https routing rule to be specified as a
-// bool or a struct alternately.
-func (r *RoutingRuleConfigOrBool) UnmarshalYAML(value *yaml.Node) error {
-	if err := value.Decode(&r.RoutingRuleConfiguration); err != nil {
-		switch err.(type) {
-		case *yaml.TypeError:
-			break
-		default:
-			return err
-		}
-	}
-
-	if !r.RoutingRuleConfiguration.isEmpty() {
-		// Unmarshalled successfully to r.RoutingRuleConfiguration, unset r.Enabled, and return.
-		r.Enabled = nil
-		return nil
-	}
-
-	if err := value.Decode(&r.Enabled); err != nil {
-		return errors.New(`cannot marshal "http" field into bool or map`)
-	}
-	return nil
-}
-
-// RoutingRuleConfiguration holds the path to route requests to the service.
-type RoutingRuleConfiguration struct {
-	Path                *string                 `yaml:"path"`
-	ProtocolVersion     *string                 `yaml:"version"`
-	HealthCheck         HealthCheckArgsOrString `yaml:"healthcheck"`
-	Stickiness          *bool                   `yaml:"stickiness"`
-	Alias               Alias                   `yaml:"alias"`
-	DeregistrationDelay *time.Duration          `yaml:"deregistration_delay"`
-	// TargetContainer is the container load balancer routes traffic to.
-	TargetContainer          *string `yaml:"target_container"`
-	TargetContainerCamelCase *string `yaml:"targetContainer"` // "targetContainerCamelCase" for backwards compatibility
-	AllowedSourceIps         []IPNet `yaml:"allowed_source_ips"`
-}
-
-func (r *RoutingRuleConfiguration) targetContainer() *string {
-	if r.TargetContainer == nil && r.TargetContainerCamelCase == nil {
-		return nil
-	}
-	if r.TargetContainer != nil {
-		return r.TargetContainer
-	}
-	return r.TargetContainerCamelCase
-}
-
-func (r *RoutingRuleConfiguration) isEmpty() bool {
-	return r.Path == nil && r.ProtocolVersion == nil && r.HealthCheck.IsEmpty() && r.Stickiness == nil && r.Alias.IsEmpty() &&
-		r.DeregistrationDelay == nil && r.TargetContainer == nil && r.TargetContainerCamelCase == nil && r.AllowedSourceIps == nil
-}
-
-// NetworkLoadBalancerConfiguration holds options for a network load balancer
+// NetworkLoadBalancerConfiguration holds options for a network load balancer.
 type NetworkLoadBalancerConfiguration struct {
-	Port            *string            `yaml:"port"`
-	HealthCheck     NLBHealthCheckArgs `yaml:"healthcheck"`
-	TargetContainer *string            `yaml:"target_container"`
-	TargetPort      *int               `yaml:"target_port"`
-	SSLPolicy       *string            `yaml:"ssl_policy"`
-	Stickiness      *bool              `yaml:"stickiness"`
-	Aliases         Alias              `yaml:"alias"`
+	Listener            NetworkLoadBalancerListener   `yaml:",inline"`
+	Aliases             Alias                         `yaml:"alias"`
+	AdditionalListeners []NetworkLoadBalancerListener `yaml:"additional_listeners"`
 }
 
+// NetworkLoadBalancerListener holds listener configuration for NLB.
+type NetworkLoadBalancerListener struct {
+	Port                *string            `yaml:"port"`
+	HealthCheck         NLBHealthCheckArgs `yaml:"healthcheck"`
+	TargetContainer     *string            `yaml:"target_container"`
+	TargetPort          *int               `yaml:"target_port"`
+	SSLPolicy           *string            `yaml:"ssl_policy"`
+	Stickiness          *bool              `yaml:"stickiness"`
+	DeregistrationDelay *time.Duration     `yaml:"deregistration_delay"`
+}
+
+// IsEmpty returns true if NetworkLoadBalancerConfiguration is empty.
 func (c *NetworkLoadBalancerConfiguration) IsEmpty() bool {
+	return c.Aliases.IsEmpty() && c.Listener.IsEmpty() && len(c.AdditionalListeners) == 0
+}
+
+// IsEmpty returns true if NetworkLoadBalancerListener is empty.
+func (c *NetworkLoadBalancerListener) IsEmpty() bool {
 	return c.Port == nil && c.HealthCheck.isEmpty() && c.TargetContainer == nil && c.TargetPort == nil &&
-		c.SSLPolicy == nil && c.Stickiness == nil && c.Aliases.IsEmpty()
+		c.SSLPolicy == nil && c.Stickiness == nil && c.DeregistrationDelay == nil
 }
 
-// IPNet represents an IP network string. For example: 10.1.0.0/16
-type IPNet string
-
-// Alias is a custom type which supports unmarshaling "http.alias" yaml which
-// can either be of type string or type slice of string.
-type Alias stringSliceOrString
-
-// IsEmpty returns empty if Alias is empty.
-func (e *Alias) IsEmpty() bool {
-	return e.String == nil && e.StringSlice == nil
-}
-
-// UnmarshalYAML overrides the default YAML unmarshaling logic for the Alias
-// struct, allowing it to perform more complex unmarshaling behavior.
-// This method implements the yaml.Unmarshaler (v3) interface.
-func (e *Alias) UnmarshalYAML(value *yaml.Node) error {
-	if err := unmarshalYAMLToStringSliceOrString((*stringSliceOrString)(e), value); err != nil {
-		return errUnmarshalAlias
+// HealthCheckPort returns the port a HealthCheck is set to for a NetworkLoadBalancerListener.
+func (listener NetworkLoadBalancerListener) HealthCheckPort(mainContainerPort *uint16) (uint16, error) {
+	// healthCheckPort is defined by Listener.HealthCheck.Port, with fallback on Listener.TargetPort, then Listener.Port.
+	if listener.HealthCheck.Port != nil {
+		return uint16(aws.IntValue(listener.HealthCheck.Port)), nil
 	}
-	return nil
+	if listener.TargetPort != nil {
+		return uint16(aws.IntValue(listener.TargetPort)), nil
+	}
+	if listener.Port != nil {
+		port, _, err := ParsePortMapping(listener.Port)
+		if err != nil {
+			return 0, err
+		}
+		parsedPort, err := strconv.ParseUint(aws.StringValue(port), 10, 16)
+		if err != nil {
+			return 0, err
+		}
+		return uint16(parsedPort), nil
+	}
+	if mainContainerPort != nil {
+		return aws.Uint16Value(mainContainerPort), nil
+	}
+	return 0, nil
 }
 
-// ToStringSlice converts an Alias to a slice of string using shell-style rules.
-func (e *Alias) ToStringSlice() ([]string, error) {
-	out, err := toStringSlice((*stringSliceOrString)(e))
-	if err != nil {
-		return nil, err
+// ExposedPorts returns all the ports that are container ports available to receive traffic.
+func (lbws *LoadBalancedWebService) ExposedPorts() (ExposedPortsIndex, error) {
+	exposedPorts := make(map[uint16]ExposedPort)
+	workloadName := aws.StringValue(lbws.Name)
+	// port from sidecar[x].image.port.
+	for name, sidecar := range lbws.Sidecars {
+		newExposedPorts, err := sidecar.exposePorts(exposedPorts, name)
+		if err != nil {
+			return ExposedPortsIndex{}, err
+		}
+		maps.Copy(exposedPorts, newExposedPorts)
 	}
-	return out, nil
+	// port from http.target_port and http.additional_rules[x].target_port
+	for _, rule := range lbws.HTTPOrBool.RoutingRules() {
+		maps.Copy(exposedPorts, rule.exposePorts(exposedPorts, workloadName))
+	}
+
+	// port from nlb.target_port and nlb.additional_listeners[x].target_port
+	for _, listener := range lbws.NLBConfig.NLBListeners() {
+		newExposedPorts, err := listener.exposePorts(exposedPorts, workloadName)
+		if err != nil {
+			return ExposedPortsIndex{}, err
+		}
+		maps.Copy(exposedPorts, newExposedPorts)
+	}
+	// port from image.port
+	maps.Copy(exposedPorts, lbws.ImageConfig.exposePorts(exposedPorts, workloadName))
+
+	portsForContainer, containerForPort := prepareParsedExposedPortsMap(exposedPorts)
+	return ExposedPortsIndex{
+		WorkloadName:      workloadName,
+		PortsForContainer: portsForContainer,
+		ContainerForPort:  containerForPort,
+	}, nil
 }
 
-// ToString converts an Alias to a string.
-func (e *Alias) ToString() string {
-	if e.String != nil {
-		return aws.StringValue(e.String)
+// NLBListeners returns main as well as additional listeners as a list of NetworkLoadBalancerListener.
+func (cfg NetworkLoadBalancerConfiguration) NLBListeners() []NetworkLoadBalancerListener {
+	if cfg.IsEmpty() {
+		return nil
 	}
-	return strings.Join(e.StringSlice, ",")
+	return append([]NetworkLoadBalancerListener{cfg.Listener}, cfg.AdditionalListeners...)
 }

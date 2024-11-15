@@ -1,5 +1,5 @@
 # pipeline show
-```bash
+```console
 $ copilot pipeline show [flags]
 ```
 
@@ -7,18 +7,18 @@ $ copilot pipeline show [flags]
 `copilot pipeline show` は、Application にデプロイされた Pipeline の構成情報 (アカウント、リージョン、ステージなど) を表示します。
 
 ## フラグ
-```bash
+```
 -a, --app string    Name of the application.
 -h, --help          help for show
-    --json          Optional. Outputs in JSON format.
+    --json          Optional. Output in JSON format.
 -n, --name string   Name of the pipeline.
     --resources     Optional. Show the resources in your pipeline.
 ```
 
 ## 実行例
-Application "myapp" の Pipeline に関する情報を表示します。
-```bash
-$ copilot pipeline show --app myapp --resources
+Pipeline "myapp-mybranch" に関する情報をリソース情報を含めて表示します。
+```console
+$ copilot pipeline show --name myrepo-mybranch --resources
 ```
 
 ## 出力例

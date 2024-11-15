@@ -8,12 +8,12 @@ import (
 	"net/http"
 
 	"github.com/aws/copilot-cli/e2e/internal/client"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("addons flow", func() {
-	Context("when creating a new app", func() {
+	Context("when creating a new app", Ordered, func() {
 		var (
 			initErr error
 		)
@@ -44,7 +44,7 @@ var _ = Describe("addons flow", func() {
 		})
 	})
 
-	Context("when creating a new environment", func() {
+	Context("when adding a new environment", Ordered, func() {
 		var (
 			testEnvInitErr error
 		)
@@ -52,17 +52,30 @@ var _ = Describe("addons flow", func() {
 			_, testEnvInitErr = cli.EnvInit(&client.EnvInitRequest{
 				AppName: appName,
 				EnvName: "test",
-				Profile: "default",
-				Prod:    false,
+				Profile: "test",
 			})
 		})
 
-		It("env init should succeed", func() {
+		It("should succeed", func() {
 			Expect(testEnvInitErr).NotTo(HaveOccurred())
 		})
 	})
 
-	Context("when adding a svc", func() {
+	Context("when deploying the environment", Ordered, func() {
+		var envDeployErr error
+		BeforeAll(func() {
+			_, envDeployErr = cli.EnvDeploy(&client.EnvDeployRequest{
+				AppName: appName,
+				Name:    "test",
+			})
+		})
+
+		It("should succeed", func() {
+			Expect(envDeployErr).NotTo(HaveOccurred())
+		})
+	})
+
+	Context("when adding a svc", Ordered, func() {
 		var (
 			svcInitErr error
 		)
@@ -101,13 +114,14 @@ var _ = Describe("addons flow", func() {
 		})
 	})
 
-	Context("when adding an RDS storage", func() {
+	Context("when adding an RDS storage", Ordered, func() {
 		var testStorageInitErr error
 		BeforeAll(func() {
 			_, testStorageInitErr = cli.StorageInit(&client.StorageInitRequest{
 				StorageName:   rdsStorageName,
 				StorageType:   rdsStorageType,
 				WorkloadName:  svcName,
+				Lifecycle:     "workload",
 				RDSEngine:     rdsEngine,
 				InitialDBName: rdsInitialDB,
 			})
@@ -123,13 +137,14 @@ var _ = Describe("addons flow", func() {
 		})
 	})
 
-	Context("when adding a S3 storage", func() {
+	Context("when adding a S3 storage", Ordered, func() {
 		var testStorageInitErr error
 		BeforeAll(func() {
 			_, testStorageInitErr = cli.StorageInit(&client.StorageInitRequest{
 				StorageName:  s3StorageName,
 				StorageType:  s3StorageType,
 				WorkloadName: svcName,
+				Lifecycle:    "workload",
 			})
 		})
 
@@ -143,7 +158,7 @@ var _ = Describe("addons flow", func() {
 		})
 	})
 
-	Context("when deploying svc", func() {
+	Context("when deploying svc", Ordered, func() {
 		var (
 			svcDeployErr error
 			svcInitErr   error
@@ -262,6 +277,7 @@ var _ = Describe("addons flow", func() {
 			Expect("./copilot").Should(BeADirectory())
 			Expect("./copilot/hello/addons").Should(BeADirectory())
 			Expect("./copilot/hello/manifest.yml").Should(BeAnExistingFile())
+			Expect("./copilot/environments/test/manifest.yml").Should(BeAnExistingFile())
 			Expect("./copilot/.workspace").ShouldNot(BeAnExistingFile())
 
 			// Need to recreate the app for AfterSuite testing.

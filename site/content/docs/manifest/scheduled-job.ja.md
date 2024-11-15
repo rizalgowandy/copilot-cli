@@ -1,35 +1,33 @@
 以下は `'Scheduled Job'` Manifest で利用できるすべてのプロパティのリストです。[Job の概念](../concepts/jobs.ja.md)説明のページも合わせてご覧ください。
 
-???+ note "レポートを作成する cron ジョブのサンプル Manifest"
+???+ note "スケジュールされた Job のサンプル Manifest"
 
-```yaml
-# Your job name will be used in naming your resources like log groups, ECS Tasks, etc.
-name: report-generator
-type: Scheduled Job
+    ```yaml
+        name: report-generator
+        type: Scheduled Job
+    
+        on:
+          schedule: "@daily"
+        cpu: 256
+        memory: 512
+        retries: 3
+        timeout: 1h
+    
+        image:
+          build: ./Dockerfile
+    
+        variables:
+          LOG_LEVEL: info
+        env_file: log.env
+        secrets:
+          GITHUB_TOKEN: GITHUB_TOKEN
 
-on:
-  schedule: "@daily"
-cpu: 256
-memory: 512
-retries: 3
-timeout: 1h
-
-image:
-  # Path to your service's Dockerfile.
-  build: ./Dockerfile
-
-variables:
-  LOG_LEVEL: info
-env_file: log.env
-secrets:
-  GITHUB_TOKEN: GITHUB_TOKEN
-
-# You can override any of the values defined above by environment.
-environments:
-  prod:
-    cpu: 2048               # Larger CPU value for prod environment
-    memory: 4096
-```
+        # 上記すべての値は Environment ごとにオーバーライド可能です。
+        environments:
+          prod:
+            cpu: 2048
+            memory: 4096
+    ```
 
 <a id="name" href="#name" class="field">`name`</a> <span class="type">String</span>  
 Job 名。
@@ -38,15 +36,15 @@ Job 名。
 
 <a id="type" href="#type" class="field">`type`</a> <span class="type">String</span>  
 Job のアーキテクチャタイプ。
-現在、Copilot は定期的にもしくは固定したスケジュールでトリガされるタスクである "Scheduled Job" タイプのみをサポートしています。
+現在、Copilot は定期的にもしくは固定したスケジュールでトリガーされるタスクである "Scheduled Job" タイプのみをサポートしています。
 
 <div class="separator"></div>
 
 <a id="on" href="#on" class="field">`on`</a> <span class="type">Map</span>  
-Job をトリガするイベントの設定。
+Job をトリガーするイベントの設定。
 
 <span class="parent-field">on.</span><a id="on-schedule" href="#on-schedule" class="field">`schedule`</a> <span class="type">String</span>  
-定期的に Job をトリガする頻度を指定できます。
+定期的に Job をトリガーする頻度を指定できます。
 サポートする頻度は:
 
 
@@ -61,11 +59,20 @@ Job をトリガするイベントの設定。
 * `"@every {duration}"` (例: "1m", "5m")
 * `"rate({duration})"` CloudWatch の[rate 式](https://docs.aws.amazon.com/ja_jp/AmazonCloudWatch/latest/events/ScheduledEvents.html#RateExpressions) の形式
 
-特定の時間に Job をトリガしたい場合、cron でスケジュールを指定できます。
+特定の時間に Job をトリガーしたい場合、cron でスケジュールを指定できます。
 
 * `"* * * * *"` 標準的な [cron フォーマット](https://en.wikipedia.org/wiki/Cron#Overview)を利用する
 * `"cron({fields})"` 6 つフィールドからなる CloudWatch の[cron 式](https://docs.aws.amazon.com/ja_jp/AmazonCloudWatch/latest/events/ScheduledEvents.html#CronExpressions) を利用する
+
+最後に、`schedule` フィールドを `none` に設定することで、Job がトリガーされないようにすることができます。
+```yaml
+on:
+  schedule: "none"
+```
+
 <div class="separator"></div>
+
+{% include 'image.ja.md' %}
 
 {% include 'image-config.ja.md' %}
 
@@ -118,6 +125,21 @@ platform:
   osfamily: windows_server_2019_full
   architecture: x86_64
 ```
+```yaml
+platform:
+  osfamily: windows_server_2019_core
+  architecture: x86_64
+```
+```yaml
+platform:
+  osfamily: windows_server_2022_core
+  architecture: x86_64
+```
+```yaml
+platform:
+  osfamily: windows_server_2022_full
+  architecture: x86_64
+```
 
 <div class="separator"></div>
 
@@ -131,20 +153,7 @@ Job の実行時間。この時間を超えた場合、Job は停止されて失
 
 <div class="separator"></div>
 
-<a id="network" href="#network" class="field">`network`</a> <span class="type">Map</span>    
-`network` セクションは VPC 内の AWS リソースに接続するためのパラメータを持ちます。
-
-<span class="parent-field">network.</span><a id="network-vpc" href="#network-vpc" class="field">`vpc`</a> <span class="type">Map</span>  
-タスクにアタッチするサブネットとセキュリティグループ。
-
-<span class="parent-field">network.vpc.</span><a id="network-vpc-placement" href="#network-vpc-placement" class="field">`placement`</a> <span class="type">String</span>    
-`'public'` か `'private'`のいずれかである必要があります。デフォルトではタスクはパブリックサブネットで起動します。
-
-!!! info
-    Copilot が作成した VPC の `'private'` サブネットを利用してタスクを実行する場合、Copilot は Environment に NAT ゲートウェイを追加します。あるいは Copilot 外で作成した VPC を `copilot env init` コマンドにてインポートしている場合は、その VPC に NAT ゲートウェイがあり、プライベートサブネットからインターネットへの接続性があることを確認してください。
-
-<span class="parent-field">network.vpc.</span><a id="network-vpc-security-groups" href="#network-vpc-security-groups" class="field">`security_groups`</a> <span class="type">Array of Strings</span>  
-タスクに関連づける追加のセキュリティグループのリスト。Copilot は常にセキュリティグループを含んでおり、環境内のコンテナは互いに通信できるようになっています。
+{% include 'network-vpc.ja.md' %}
 
 <div class="separator"></div>
 
@@ -173,31 +182,31 @@ volumes:
       ...
 ```
 
-<span class="parent-field">storage.volumes.</span><a id="volume" href="#volume" class="field">`volume`</a> <span class="type">Map</span>  
+<span class="parent-field">storage.volumes.</span><a id="volume" href="#volume" class="field">`<volume>`</a> <span class="type">Map</span>  
 ボリュームの設定を指定します。
 
-<span class="parent-field">volume.</span><a id="path" href="#path" class="field">`path`</a> <span class="type">String</span>  
+<span class="parent-field">storage.volumes.`<volume>`.</span><a id="path" href="#path" class="field">`path`</a> <span class="type">String</span>  
 必須項目。コンテナ内でボリュームをマウントしたい場所を指定します。利用できる文字は `a-zA-Z0-9.-_/` のみで、 242 文字未満である必要があります。
 
-<span class="parent-field">volume.</span><a id="read_only" href="#read-only" class="field">`read_only`</a> <span class="type">Bool</span>  
+<span class="parent-field">storage.volumes.`<volume>`.</span><a id="read_only" href="#read-only" class="field">`read_only`</a> <span class="type">Bool</span>  
 任意項目。デフォルトでは `true` です。ボリュームが読み込み専用か否かを定義します。 false の場合、コンテナにファイルシステムへの `elasticfilesystem:ClientWrite` 権限が付与され、ボリュームは書き込み可能になります。
 
-<span class="parent-field">volume.</span><a id="efs" href="#efs" class="field">`efs`</a> <span class="type">Map</span>  
+<span class="parent-field">storage.volumes.`<volume>`.</span><a id="efs" href="#efs" class="field">`efs`</a> <span class="type">Map</span>  
 より詳細な EFS の設定。
 
-<span class="parent-field">volume.efs.</span><a id="id" href="#id" class="field">`id`</a> <span class="type">String</span>  
+<span class="parent-field">storage.volumes.`<volume>`.efs.</span><a id="id" href="#id" class="field">`id`</a> <span class="type">String</span>  
 必須項目。マウントするファイルシステムの ID 。
 
-<span class="parent-field">volume.efs.</span><a id="root_dir" href="#root-dir" class="field">`root_dir`</a> <span class="type">String</span>  
+<span class="parent-field">storage.volumes.`<volume>`.efs.</span><a id="root_dir" href="#root-dir" class="field">`root_dir`</a> <span class="type">String</span>  
 任意項目。デフォルトは `/` です。ボリュームのルートとして使用する EFS ファイルシステム内の場所を指定します。利用できる文字は `a-zA-Z0-9.-_/` のみで、 255 文字未満である必要があります。アクセスポイントを利用する場合、`root_dir` は空か `/` であり、`auth.iam` が `true` である必要があります。
 
-<span class="parent-field">volume.efs.</span><a id="auth" href="#auth" class="field">`auth`</a> <span class="type">Map</span>  
+<span class="parent-field">storage.volumes.`<volume>`.efs.</span><a id="auth" href="#auth" class="field">`auth`</a> <span class="type">Map</span>  
 EFS の高度な認可の設定を指定します。
 
-<span class="parent-field">volume.efs.auth.</span><a id="iam" href="#iam" class="field">`iam`</a> <span class="type">Bool</span>  
+<span class="parent-field">storage.volumes.`<volume>`.efs.auth.</span><a id="iam" href="#iam" class="field">`iam`</a> <span class="type">Bool</span>  
 任意項目。デフォルトは `true` です。volume の EFS への接続の可否の判定に IAM を利用するかしないかを設定します。
 
-<span class="parent-field">volume.efs.auth.</span><a id="access_point_id" href="#access-point-id" class="field">`access_point_id`</a> <span class="type">String</span>  
+<span class="parent-field">storage.volumes.`<volume>`.efs.auth.</span><a id="access_point_id" href="#access-point-id" class="field">`access_point_id`</a> <span class="type">String</span>  
 任意項目。デフォルトでは `""` が設定されます。接続する EFS アクセスポイントの ID です。アクセスポイントを利用する場合、`root_dir` は空か `/` であり、`auth.iam` が `true` である必要があります。
 
 <div class="separator"></div>
@@ -206,7 +215,7 @@ EFS の高度な認可の設定を指定します。
 logging セクションには、コンテナの [FireLens](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/using_firelens.html) ログドライバ用のログ設定パラメータが含まれます。(設定例は[こちら](../developing/sidecars.ja.md#sidecar-patterns))
 
 <span class="parent-field">logging.</span><a id="logging-image" href="#logging-image" class="field">`image`</a> <span class="type">Map</span>  
-任意項目。使用する Fluent Bit のイメージ。デフォルト値は `public.ecr.aws/aws-observability/aws-for-fluent-bit:latest`。
+任意項目。使用する Fluent Bit のイメージ。デフォルト値は `public.ecr.aws/aws-observability/aws-for-fluent-bit:stable`。
 
 <span class="parent-field">logging.</span><a id="logging-destination" href="#logging-destination" class="field">`destination`</a> <span class="type">Map</span>  
 任意項目。Firelens ログドライバーにログを送信するときの設定。

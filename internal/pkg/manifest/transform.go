@@ -6,6 +6,8 @@ package manifest
 import (
 	"fmt"
 	"reflect"
+	"strings"
+	"time"
 
 	"github.com/imdario/mergo"
 )
@@ -18,17 +20,26 @@ var defaultTransformers = []mergo.Transformers{
 	basicTransformer{},
 	imageTransformer{},
 	buildArgsOrStringTransformer{},
+	aliasTransformer{},
 	stringSliceOrStringTransformer{},
 	platformArgsOrStringTransformer{},
-	healthCheckArgsOrStringTransformer{},
+	securityGroupsIDsOrConfigTransformer{},
+	serviceConnectTransformer{},
+	placementArgOrStringTransformer{},
+	subnetListOrArgsTransformer{},
+	unionTransformer{},
 	countTransformer{},
 	advancedCountTransformer{},
+	scalingConfigOrTTransformer[Percentage]{},
+	scalingConfigOrTTransformer[int]{},
+	scalingConfigOrTTransformer[time.Duration]{},
 	rangeTransformer{},
 	efsConfigOrBoolTransformer{},
 	efsVolumeConfigurationTransformer{},
 	sqsQueueOrBoolTransformer{},
-	routingRuleConfigOrBoolTransformer{},
+	httpOrBoolTransformer{},
 	secretTransformer{},
+	environmentCDNConfigTransformer{},
 }
 
 // See a complete list of `reflect.Kind` here: https://pkg.go.dev/reflect#Kind.
@@ -97,17 +108,44 @@ func (t buildArgsOrStringTransformer) Transformer(typ reflect.Type) func(dst, sr
 	}
 }
 
-type stringSliceOrStringTransformer struct{}
+type aliasTransformer struct{}
 
-// Transformer returns custom merge logic for stringSliceOrStringTransformer's fields.
-func (t stringSliceOrStringTransformer) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
-	if !typ.ConvertibleTo(reflect.TypeOf(stringSliceOrString{})) {
+// Transformer returns custom merge logic for Alias's fields.
+func (t aliasTransformer) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
+	if typ != reflect.TypeOf(Alias{}) {
 		return nil
 	}
 
 	return func(dst, src reflect.Value) error {
-		dstStruct := dst.Convert(reflect.TypeOf(stringSliceOrString{})).Interface().(stringSliceOrString)
-		srcStruct := src.Convert(reflect.TypeOf(stringSliceOrString{})).Interface().(stringSliceOrString)
+		dstStruct := dst.Convert(reflect.TypeOf(Alias{})).Interface().(Alias)
+		srcStruct := src.Convert(reflect.TypeOf(Alias{})).Interface().(Alias)
+
+		if len(srcStruct.AdvancedAliases) != 0 {
+			dstStruct.StringSliceOrString = StringSliceOrString{}
+		}
+
+		if !srcStruct.StringSliceOrString.isEmpty() {
+			dstStruct.AdvancedAliases = nil
+		}
+
+		if dst.CanSet() { // For extra safety to prevent panicking.
+			dst.Set(reflect.ValueOf(dstStruct).Convert(typ))
+		}
+		return nil
+	}
+}
+
+type stringSliceOrStringTransformer struct{}
+
+// Transformer returns custom merge logic for StringSliceOrString's fields.
+func (t stringSliceOrStringTransformer) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
+	if !typ.ConvertibleTo(reflect.TypeOf(StringSliceOrString{})) {
+		return nil
+	}
+
+	return func(dst, src reflect.Value) error {
+		dstStruct := dst.Convert(reflect.TypeOf(StringSliceOrString{})).Interface().(StringSliceOrString)
+		srcStruct := src.Convert(reflect.TypeOf(StringSliceOrString{})).Interface().(StringSliceOrString)
 
 		if srcStruct.String != nil {
 			dstStruct.StringSlice = nil
@@ -150,28 +188,149 @@ func (t platformArgsOrStringTransformer) Transformer(typ reflect.Type) func(dst,
 	}
 }
 
-type healthCheckArgsOrStringTransformer struct{}
+type securityGroupsIDsOrConfigTransformer struct{}
 
-// Transformer returns custom merge logic for HealthCheckArgsOrString's fields.
-func (t healthCheckArgsOrStringTransformer) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
-	if typ != reflect.TypeOf(HealthCheckArgsOrString{}) {
+// Transformer returns custom merge logic for SecurityGroupsIDsOrConfig's fields.
+func (s securityGroupsIDsOrConfigTransformer) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
+	if typ != reflect.TypeOf(SecurityGroupsIDsOrConfig{}) {
 		return nil
 	}
 
 	return func(dst, src reflect.Value) error {
-		dstStruct, srcStruct := dst.Interface().(HealthCheckArgsOrString), src.Interface().(HealthCheckArgsOrString)
+		dstStruct, srcStruct := dst.Interface().(SecurityGroupsIDsOrConfig), src.Interface().(SecurityGroupsIDsOrConfig)
 
-		if srcStruct.HealthCheckPath != nil {
-			dstStruct.HealthCheckArgs = HTTPHealthCheckArgs{}
+		if !srcStruct.AdvancedConfig.isEmpty() {
+			dstStruct.IDs = nil
 		}
 
-		if !srcStruct.HealthCheckArgs.isEmpty() {
-			dstStruct.HealthCheckPath = nil
+		if srcStruct.IDs != nil {
+			dstStruct.AdvancedConfig = SecurityGroupsConfig{}
 		}
 
 		if dst.CanSet() { // For extra safety to prevent panicking.
 			dst.Set(reflect.ValueOf(dstStruct))
 		}
+		return nil
+	}
+}
+
+type placementArgOrStringTransformer struct{}
+
+// Transformer returns custom merge logic for placementArgOrString's fields.
+func (t placementArgOrStringTransformer) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
+	if typ != reflect.TypeOf(PlacementArgOrString{}) {
+		return nil
+	}
+
+	return func(dst, src reflect.Value) error {
+		dstStruct, srcStruct := dst.Interface().(PlacementArgOrString), src.Interface().(PlacementArgOrString)
+
+		if srcStruct.PlacementString != nil {
+			dstStruct.PlacementArgs = PlacementArgs{}
+		}
+
+		if !srcStruct.PlacementArgs.isEmpty() {
+			dstStruct.PlacementString = nil
+		}
+
+		if dst.CanSet() { // For extra safety to prevent panicking.
+			dst.Set(reflect.ValueOf(dstStruct))
+		}
+		return nil
+	}
+}
+
+type serviceConnectTransformer struct{}
+
+// Transformer returns custom merge logic for serviceConnectTransformer's fields.
+func (t serviceConnectTransformer) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
+	if typ != reflect.TypeOf(ServiceConnectBoolOrArgs{}) {
+		return nil
+	}
+
+	return func(dst, src reflect.Value) error {
+		dstStruct, srcStruct := dst.Interface().(ServiceConnectBoolOrArgs), src.Interface().(ServiceConnectBoolOrArgs)
+
+		if srcStruct.EnableServiceConnect != nil {
+			dstStruct.ServiceConnectArgs = ServiceConnectArgs{}
+		}
+
+		if !srcStruct.ServiceConnectArgs.isEmpty() {
+			dstStruct.EnableServiceConnect = nil
+		}
+
+		if dst.CanSet() { // For extra safety to prevent panicking.
+			dst.Set(reflect.ValueOf(dstStruct))
+		}
+		return nil
+	}
+}
+
+type subnetListOrArgsTransformer struct{}
+
+// Transformer returns custom merge logic for subnetListOrArgsTransformer's fields.
+func (t subnetListOrArgsTransformer) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
+	if typ != reflect.TypeOf(SubnetListOrArgs{}) {
+		return nil
+	}
+
+	return func(dst, src reflect.Value) error {
+		dstStruct, srcStruct := dst.Interface().(SubnetListOrArgs), src.Interface().(SubnetListOrArgs)
+
+		if len(srcStruct.IDs) != 0 {
+			dstStruct.SubnetArgs = SubnetArgs{}
+		}
+
+		if !srcStruct.SubnetArgs.isEmpty() {
+			dstStruct.IDs = nil
+		}
+
+		if dst.CanSet() { // For extra safety to prevent panicking.
+			dst.Set(reflect.ValueOf(dstStruct))
+		}
+		return nil
+	}
+}
+
+type unionTransformer struct{}
+
+var unionPrefix, _, _ = strings.Cut(reflect.TypeOf(Union[any, any]{}).String(), "[")
+
+// Transformer returns custom merge logic for union types.
+func (t unionTransformer) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
+	// :sweat_smile: https://github.com/golang/go/issues/54393
+	// reflect currently doesn't have support for getting type parameters
+	// or checking if a type is a non-specific instantiation of a generic type
+	// (i.e., no way to tell if the type Union[string, bool] is a Union)
+	isUnion := strings.HasPrefix(typ.String(), unionPrefix)
+	if !isUnion {
+		return nil
+	}
+
+	return func(dst, src reflect.Value) (err error) {
+		defer func() {
+			// should realistically never happen unless Union type code has been
+			// refactored to change functions called via reflection.
+			if r := recover(); r != nil {
+				err = fmt.Errorf("override union: %v", r)
+			}
+		}()
+
+		isBasic := src.MethodByName("IsBasic").Call(nil)[0].Bool()
+		isAdvanced := src.MethodByName("IsAdvanced").Call(nil)[0].Bool()
+
+		// Call SetType with the correct type based on src's type.
+		// We use the value from dst because it holds the merged value.
+		if isBasic {
+			if dst.CanAddr() {
+				dst.Addr().MethodByName("SetBasic").Call([]reflect.Value{dst.FieldByName("Basic")})
+			}
+		} else if isAdvanced {
+			if dst.CanAddr() {
+				dst.Addr().MethodByName("SetAdvanced").Call([]reflect.Value{dst.FieldByName("Advanced")})
+			}
+		}
+
 		return nil
 	}
 }
@@ -219,6 +378,32 @@ func (t advancedCountTransformer) Transformer(typ reflect.Type) func(dst, src re
 
 		if srcStruct.hasAutoscaling() {
 			dstStruct.Spot = nil
+		}
+
+		if dst.CanSet() { // For extra safety to prevent panicking.
+			dst.Set(reflect.ValueOf(dstStruct))
+		}
+		return nil
+	}
+}
+
+type scalingConfigOrTTransformer[T ~int | time.Duration] struct{}
+
+// Transformer returns custom merge logic for ScalingConfigOrPercentage's fields.
+func (t scalingConfigOrTTransformer[T]) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
+	if typ != reflect.TypeOf(ScalingConfigOrT[T]{}) {
+		return nil
+	}
+
+	return func(dst, src reflect.Value) error {
+		dstStruct, srcStruct := dst.Interface().(ScalingConfigOrT[T]), src.Interface().(ScalingConfigOrT[T])
+
+		if !srcStruct.ScalingConfig.IsEmpty() {
+			dstStruct.Value = nil
+		}
+
+		if srcStruct.Value != nil {
+			dstStruct.ScalingConfig = AdvancedScalingConfig[T]{}
 		}
 
 		if dst.CanSet() { // For extra safety to prevent panicking.
@@ -328,22 +513,22 @@ func (q sqsQueueOrBoolTransformer) Transformer(typ reflect.Type) func(dst, src r
 	}
 }
 
-type routingRuleConfigOrBoolTransformer struct{}
+type httpOrBoolTransformer struct{}
 
-// Transformer returns custom merge logic for RoutingRuleConfigOrBool's fields.
-func (t routingRuleConfigOrBoolTransformer) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
-	if typ != reflect.TypeOf(RoutingRuleConfigOrBool{}) {
+// Transformer returns custom merge logic for HTTPOrBool's fields.
+func (t httpOrBoolTransformer) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
+	if typ != reflect.TypeOf(HTTPOrBool{}) {
 		return nil
 	}
 	return func(dst, src reflect.Value) error {
-		dstStruct, srcStruct := dst.Interface().(RoutingRuleConfigOrBool), src.Interface().(RoutingRuleConfigOrBool)
+		dstStruct, srcStruct := dst.Interface().(HTTPOrBool), src.Interface().(HTTPOrBool)
 
-		if !srcStruct.RoutingRuleConfiguration.isEmpty() {
+		if !srcStruct.HTTP.IsEmpty() {
 			dstStruct.Enabled = nil
 		}
 
 		if srcStruct.Enabled != nil {
-			dstStruct.RoutingRuleConfiguration = RoutingRuleConfiguration{}
+			dstStruct.HTTP = HTTP{}
 		}
 
 		if dst.CanSet() { // For extra safety to prevent panicking.
@@ -364,11 +549,37 @@ func (t secretTransformer) Transformer(typ reflect.Type) func(dst, src reflect.V
 		dstStruct, srcStruct := dst.Interface().(Secret), src.Interface().(Secret)
 
 		if !srcStruct.fromSecretsManager.IsEmpty() {
-			dstStruct.from = nil
+			dstStruct.from = StringOrFromCFN{}
 		}
 
-		if srcStruct.from != nil {
+		if !srcStruct.from.isEmpty() {
 			dstStruct.fromSecretsManager = secretsManagerSecret{}
+		}
+
+		if dst.CanSet() { // For extra safety to prevent panicking.
+			dst.Set(reflect.ValueOf(dstStruct))
+		}
+		return nil
+	}
+}
+
+type environmentCDNConfigTransformer struct{}
+
+// Transformer returns custom merge logic for environmentCDNConfig's fields.
+func (t environmentCDNConfigTransformer) Transformer(typ reflect.Type) func(dst, src reflect.Value) error {
+	if typ != reflect.TypeOf(EnvironmentCDNConfig{}) {
+		return nil
+	}
+
+	return func(dst, src reflect.Value) error {
+		dstStruct, srcStruct := dst.Interface().(EnvironmentCDNConfig), src.Interface().(EnvironmentCDNConfig)
+
+		if !srcStruct.Config.isEmpty() {
+			dstStruct.Enabled = nil
+		}
+
+		if srcStruct.Enabled != nil {
+			dstStruct.Config = AdvancedCDNConfig{}
 		}
 
 		if dst.CanSet() { // For extra safety to prevent panicking.

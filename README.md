@@ -1,12 +1,13 @@
 ##  <img align="left" alt="AWS Copilot CLI" src="./site/content/assets/images/copilot-logo-48-light.svg" width="85" /> AWS Copilot CLI
 ###### _Build, Release and Operate Containerized Applications on AWS._ 
 
-![latest version](https://img.shields.io/github/v/release/aws/copilot-cli) [![Join the chat at https://gitter.im/aws/copilot-cli](https://badges.gitter.im/aws/copilot-cli.svg)](https://gitter.im/aws/copilot-cli?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
+![latest version](https://img.shields.io/github/v/release/aws/copilot-cli)
+[![Join the chat at https://gitter.im/aws/copilot-cli](https://badges.gitter.im/aws/copilot-cli.svg)](https://gitter.im/aws/copilot-cli?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 * **Documentation**: [https://aws.github.io/copilot-cli/](https://aws.github.io/copilot-cli/)
 
-The AWS Copilot CLI is a tool for developers to build, release and operate production ready containerized applications 
-on AWS App Runner, Amazon ECS, and AWS Fargate.  
+The AWS Copilot CLI is a tool for developers to build, release and operate production-ready containerized applications
+on AWS App Runner or Amazon ECS on AWS Fargate.
 
 Use Copilot to:
 * Deploy production-ready, scalable services on AWS from a Dockerfile in one command.

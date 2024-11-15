@@ -14,11 +14,13 @@ import (
 )
 
 const (
-	defaultForAZFilterName  = "default-for-az"
-	internetGatewayIDPrefix = "igw-"
+	defaultForAZFilterName   = "default-for-az"
+	internetGatewayIDPrefix  = "igw-"
+	cloudFrontPrefixListName = "com.amazonaws.global.cloudfront.origin-facing"
 
-	// TagFilterName is the filter name format for tag filters
-	TagFilterName = "tag:%s"
+	// FmtTagFilter is the filter name format for tag filters
+	FmtTagFilter = "tag:%s"
+	tagKeyFilter = "tag-key"
 )
 
 var (
@@ -37,6 +39,7 @@ type api interface {
 	DescribeNetworkInterfaces(input *ec2.DescribeNetworkInterfacesInput) (*ec2.DescribeNetworkInterfacesOutput, error)
 	DescribeRouteTables(input *ec2.DescribeRouteTablesInput) (*ec2.DescribeRouteTablesOutput, error)
 	DescribeAvailabilityZones(input *ec2.DescribeAvailabilityZonesInput) (*ec2.DescribeAvailabilityZonesOutput, error)
+	DescribeManagedPrefixLists(input *ec2.DescribeManagedPrefixListsInput) (*ec2.DescribeManagedPrefixListsOutput, error)
 }
 
 // Filter contains the name and values of a filter.
@@ -46,6 +49,17 @@ type Filter struct {
 	Name string
 	// Value of the filter.
 	Values []string
+}
+
+// FilterForTags takes a key and optional values to construct an EC2 filter.
+func FilterForTags(key string, values ...string) Filter {
+	if len(values) == 0 {
+		return Filter{Name: tagKeyFilter, Values: []string{key}}
+	}
+	return Filter{
+		Name:   fmt.Sprintf(FmtTagFilter, key),
+		Values: values,
+	}
 }
 
 // EC2 wraps an AWS EC2 client.
@@ -320,7 +334,6 @@ func (c *EC2) subnets(filters ...Filter) ([]*ec2.Subnet, error) {
 		return nil, fmt.Errorf("describe subnets: %w", err)
 	}
 	subnets = append(subnets, response.Subnets...)
-
 	for response.NextToken != nil {
 		response, err = c.client.DescribeSubnets(&ec2.DescribeSubnetsInput{
 			Filters:   inputFilters,
@@ -331,7 +344,9 @@ func (c *EC2) subnets(filters ...Filter) ([]*ec2.Subnet, error) {
 		}
 		subnets = append(subnets, response.Subnets...)
 	}
-
+	if len(subnets) == 0 {
+		return nil, fmt.Errorf("cannot find any subnets")
+	}
 	return subnets, nil
 }
 
@@ -436,4 +451,46 @@ func (idx *routeTableIndex) IsPublicSubnet(subnetID string) bool {
 		return rt.HasIGW()
 	}
 	return idx.mainTable.HasIGW()
+}
+
+// managedPrefixList returns the DescribeManagedPrefixListsOutput of a query by name.
+func (c *EC2) managedPrefixList(prefixListName string) (*ec2.DescribeManagedPrefixListsOutput, error) {
+	prefixListOutput, err := c.client.DescribeManagedPrefixLists(&ec2.DescribeManagedPrefixListsInput{
+		Filters: []*ec2.Filter{
+			{
+				Name:   aws.String("prefix-list-name"),
+				Values: aws.StringSlice([]string{prefixListName}),
+			},
+		},
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("describe managed prefix list with name %s: %w", prefixListName, err)
+	}
+
+	return prefixListOutput, nil
+}
+
+// CloudFrontManagedPrefixListID returns the PrefixListId of the associated cloudfront prefix list as a *string.
+func (c *EC2) CloudFrontManagedPrefixListID() (string, error) {
+	prefixListsOutput, err := c.managedPrefixList(cloudFrontPrefixListName)
+
+	if err != nil {
+		return "", err
+	}
+
+	var ids []string
+	for _, v := range prefixListsOutput.PrefixLists {
+		ids = append(ids, *v.PrefixListId)
+	}
+
+	if len(ids) == 0 {
+		return "", fmt.Errorf("cannot find any prefix list with name: %s", cloudFrontPrefixListName)
+	}
+
+	if len(ids) > 1 {
+		return "", fmt.Errorf("found more than one prefix list with the name %s: %v", cloudFrontPrefixListName, ids)
+	}
+
+	return ids[0], nil
 }

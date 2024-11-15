@@ -11,24 +11,21 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/aws/copilot-cli/internal/pkg/template"
+	"github.com/aws/copilot-cli/internal/pkg/version"
 	"gopkg.in/yaml.v3"
 
-	"github.com/aws/copilot-cli/internal/pkg/aws/ec2"
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
 	"github.com/aws/copilot-cli/internal/pkg/config"
-	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	cfnstack "github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
 	"github.com/aws/copilot-cli/internal/pkg/describe/stack"
+	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
 )
 
 var (
 	fmtLegacySvcDiscoveryEndpoint = "%s.local"
 )
-
-type vpcSubnetLister interface {
-	ListVPCSubnets(vpcID string) (*ec2.VPCSubnets, error)
-}
 
 // EnvDescription contains the information about an environment.
 type EnvDescription struct {
@@ -53,10 +50,9 @@ type EnvDescriber struct {
 	env             *config.Environment
 	enableResources bool
 
-	configStore  ConfigStoreSvc
-	deployStore  DeployedEnvServicesLister
-	cfn          stackDescriber
-	subnetLister vpcSubnetLister
+	configStore ConfigStoreSvc
+	deployStore DeployedEnvServicesLister
+	cfn         stackDescriber
 
 	// Cached values for reuse.
 	description *EnvDescription
@@ -86,10 +82,9 @@ func NewEnvDescriber(opt NewEnvDescriberConfig) (*EnvDescriber, error) {
 		env:             env,
 		enableResources: opt.EnableResources,
 
-		configStore:  opt.ConfigStore,
-		deployStore:  opt.DeployStore,
-		cfn:          stack.NewStackDescriber(cfnstack.NameForEnv(opt.App, opt.Env), sess),
-		subnetLister: ec2.New(sess),
+		configStore: opt.ConfigStore,
+		deployStore: opt.DeployStore,
+		cfn:         stack.NewStackDescriber(cfnstack.NameForEnv(opt.App, opt.Env), sess),
 	}, nil
 }
 
@@ -131,6 +126,32 @@ func (d *EnvDescriber) Describe() (*EnvDescription, error) {
 	return d.description, nil
 }
 
+// Manifest returns the contents of the manifest used to deploy an environment stack.
+func (d *EnvDescriber) Manifest() ([]byte, error) {
+	tpl, err := d.cfn.StackMetadata()
+	if err != nil {
+		return nil, err
+	}
+
+	metadata := struct {
+		Manifest string `yaml:"Manifest"`
+	}{}
+	if err := yaml.Unmarshal([]byte(tpl), &metadata); err != nil {
+		return nil, fmt.Errorf("unmarshal Metadata.Manifest in environment stack: %v", err)
+	}
+
+	if metadata.Manifest != "" {
+		return []byte(strings.TrimSpace(metadata.Manifest)), nil
+	}
+	// Otherwise, the Manifest wasn't written into the CloudFormation template, we'll convert the config in SSM.
+	mft := manifest.FromEnvConfig(d.env, template.New())
+	out, err := yaml.Marshal(mft)
+	if err != nil {
+		return nil, fmt.Errorf("marshal manifest generated from SSM: %v", err)
+	}
+	return []byte(strings.TrimSpace(string(out))), nil
+}
+
 // Params returns the parameters of the environment stack.
 func (d *EnvDescriber) Params() (map[string]string, error) {
 	descr, err := d.cfn.Describe()
@@ -140,7 +161,7 @@ func (d *EnvDescriber) Params() (map[string]string, error) {
 	return descr.Parameters, nil
 }
 
-// Params returns the outputs of the environment stack.
+// Outputs returns the outputs of the environment stack.
 func (d *EnvDescriber) Outputs() (map[string]string, error) {
 	descr, err := d.cfn.Describe()
 	if err != nil {
@@ -149,26 +170,27 @@ func (d *EnvDescriber) Outputs() (map[string]string, error) {
 	return descr.Outputs, nil
 }
 
+// AvailableFeatures returns the available features of the environment stack.
+func (d *EnvDescriber) AvailableFeatures() ([]string, error) {
+	params, err := d.Params()
+	if err != nil {
+		return nil, err
+	}
+	var availableFeatures []string
+	for _, f := range template.AvailableEnvFeatures() {
+		if _, ok := params[f]; ok {
+			availableFeatures = append(availableFeatures, f)
+		}
+	}
+	return availableFeatures, nil
+}
+
 // Version returns the CloudFormation template version associated with
 // the environment by reading the Metadata.Version field from the template.
 //
-// If the Version field does not exist, then it's a legacy template and it returns an deploy.LegacyEnvTemplateVersion and nil error.
+// If the Version field does not exist, then it's a legacy template and it returns an version.LegacyEnvTemplate and nil error.
 func (d *EnvDescriber) Version() (string, error) {
-	raw, err := d.cfn.StackMetadata()
-	if err != nil {
-		return "", err
-	}
-
-	metadata := struct {
-		Version string `yaml:"Version"`
-	}{}
-	if err := yaml.Unmarshal([]byte(raw), &metadata); err != nil {
-		return "", fmt.Errorf("unmarshal Metadata property to read Version: %w", err)
-	}
-	if metadata.Version == "" {
-		return deploy.LegacyEnvTemplateVersion, nil
-	}
-	return metadata.Version, nil
+	return stackVersion(d.cfn, version.LegacyEnvTemplate)
 }
 
 // ServiceDiscoveryEndpoint returns the endpoint the environment was initialized with, if any. Otherwise,
@@ -191,24 +213,6 @@ func (d *EnvDescriber) ServiceDiscoveryEndpoint() (string, error) {
 	}
 	// If the param does not exist, the environment is legacy, has not been upgraded, and uses `app.local`.
 	return fmt.Sprintf(fmtLegacySvcDiscoveryEndpoint, d.app), nil
-}
-
-// PublicCIDRBlocks returns the public CIDR blocks of the public subnets in the environment VPC.
-func (d *EnvDescriber) PublicCIDRBlocks() ([]string, error) {
-	_, envVPC, err := d.loadStackInfo()
-	if err != nil {
-		return nil, err
-	}
-	vpcID := envVPC.ID
-	subnets, err := d.subnetLister.ListVPCSubnets(vpcID)
-	if err != nil {
-		return nil, fmt.Errorf("list subnets of vpc %s in environment %s: %w", vpcID, d.env.Name, err)
-	}
-	var cidrBlocks []string
-	for _, subnet := range subnets.Public {
-		cidrBlocks = append(cidrBlocks, subnet.CIDRBlock)
-	}
-	return cidrBlocks, nil
 }
 
 func (d *EnvDescriber) loadStackInfo() (map[string]string, EnvironmentVPC, error) {
@@ -274,6 +278,48 @@ func (d *EnvDescriber) filterDeployedJobs() ([]*config.Workload, error) {
 	return deployedJobs, nil
 }
 
+// ValidateCFServiceDomainAliases returns error if an environment using cdn is deployed without specifying http.alias for all load-balanced web services
+func (d *EnvDescriber) ValidateCFServiceDomainAliases() error {
+	stackDescr, err := d.cfn.Describe()
+	if err != nil {
+		return fmt.Errorf("describe stack: %w", err)
+	}
+
+	servicesString, ok := stackDescr.Parameters[cfnstack.EnvParamALBWorkloadsKey]
+	if !ok || servicesString == "" {
+		return nil
+	}
+	services := strings.Split(servicesString, ",")
+
+	jsonOutput, ok := stackDescr.Parameters[cfnstack.EnvParamAliasesKey]
+	if !ok {
+		return fmt.Errorf("cannot find %s in env stack parameter set", cfnstack.EnvParamAliasesKey)
+	}
+
+	var aliases map[string][]string
+	if jsonOutput != "" {
+		err = json.Unmarshal([]byte(jsonOutput), &aliases)
+		if err != nil {
+			return fmt.Errorf("unmarshal %q: %w", jsonOutput, err)
+		}
+	}
+
+	var lbSvcsWithoutAlias []string
+	for _, service := range services {
+		if _, ok := aliases[service]; !ok {
+			lbSvcsWithoutAlias = append(lbSvcsWithoutAlias, service)
+		}
+	}
+	if len(lbSvcsWithoutAlias) != 0 {
+		return &errLBWebSvcsOnCFWithoutAlias{
+			services:   lbSvcsWithoutAlias,
+			aliasField: "http.alias",
+		}
+	}
+
+	return nil
+}
+
 // JSONString returns the stringified EnvDescription struct with json format.
 func (e *EnvDescription) JSONString() (string, error) {
 	b, err := json.Marshal(e)
@@ -290,7 +336,6 @@ func (e *EnvDescription) HumanString() string {
 	fmt.Fprint(writer, color.Bold.Sprint("About\n\n"))
 	writer.Flush()
 	fmt.Fprintf(writer, "  %s\t%s\n", "Name", e.Environment.Name)
-	fmt.Fprintf(writer, "  %s\t%t\n", "Production", e.Environment.Prod)
 	fmt.Fprintf(writer, "  %s\t%s\n", "Region", e.Environment.Region)
 	fmt.Fprintf(writer, "  %s\t%s\n", "Account ID", e.Environment.AccountID)
 	fmt.Fprint(writer, color.Bold.Sprint("\nWorkloads\n\n"))

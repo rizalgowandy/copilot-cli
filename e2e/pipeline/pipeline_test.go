@@ -14,7 +14,7 @@ import (
 
 	"github.com/aws/copilot-cli/e2e/internal/client"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -68,13 +68,12 @@ var _ = Describe("pipeline flow", func() {
 		})
 	})
 
-	Context("when creating a new environment", func() {
+	Context("when adding a new environment", func() {
 		It("test env init should succeed", func() {
 			_, err := copilot.EnvInit(&client.EnvInitRequest{
 				AppName: appName,
 				EnvName: "test",
-				Profile: "e2etestenv",
-				Prod:    false,
+				Profile: "test",
 			})
 			Expect(err).NotTo(HaveOccurred())
 		})
@@ -82,8 +81,7 @@ var _ = Describe("pipeline flow", func() {
 			_, err := copilot.EnvInit(&client.EnvInitRequest{
 				AppName: appName,
 				EnvName: "prod",
-				Profile: "e2eprodenv",
-				Prod:    false,
+				Profile: "prod",
 			})
 			Expect(err).NotTo(HaveOccurred())
 		})
@@ -100,6 +98,23 @@ var _ = Describe("pipeline flow", func() {
 
 			Expect(envs["test"]).NotTo(BeNil())
 			Expect(envs["prod"]).NotTo(BeNil())
+		})
+	})
+
+	Context("when deploying the environments", func() {
+		It("test env deploy should succeed", func() {
+			_, err := copilot.EnvDeploy(&client.EnvDeployRequest{
+				AppName: appName,
+				Name:    "test",
+			})
+			Expect(err).NotTo(HaveOccurred())
+		})
+		It("prod env deploy should succeed", func() {
+			_, err := copilot.EnvDeploy(&client.EnvDeployRequest{
+				AppName: appName,
+				Name:    "prod",
+			})
+			Expect(err).NotTo(HaveOccurred())
 		})
 	})
 
@@ -131,6 +146,7 @@ var _ = Describe("pipeline flow", func() {
 				URL:          repoURL,
 				GitBranch:    "master",
 				Environments: []string{"test", "prod"},
+				Type:         "Workloads",
 			})
 			Expect(err).NotTo(HaveOccurred())
 		})

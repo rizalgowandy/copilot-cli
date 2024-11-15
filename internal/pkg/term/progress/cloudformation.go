@@ -17,9 +17,14 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// StackSubscriber is the interface to subscribe channels to a CloudFormation stack stream event.
+// StackSubscriber is the interface to subscribe to a CloudFormation stack event stream.
 type StackSubscriber interface {
 	Subscribe() <-chan stream.StackEvent
+}
+
+// StackSetSubscriber is the interface to subscribe channels to a CloudFormation stack set event stream.
+type StackSetSubscriber interface {
+	Subscribe() <-chan stream.StackSetOpEvent
 }
 
 // ResourceRendererOpts is optional configuration for a listening CloudFormation resource renderer.
@@ -28,7 +33,16 @@ type ResourceRendererOpts struct {
 	RenderOpts RenderOptions
 }
 
-// ECSServiceRendererOpts is optional configuration for a listening ECS service renderer.
+// ECSServiceRendererCfg holds required configuration for initializing an ECS service renderer.
+type ECSServiceRendererCfg struct {
+	Streamer    StackSubscriber
+	ECSClient   stream.ECSServiceDescriber
+	CWClient    stream.CloudWatchDescriber
+	LogicalID   string
+	Description string
+}
+
+// ECSServiceRendererOpts holds optional configuration for a listening ECS service renderer.
 type ECSServiceRendererOpts struct {
 	Group      *errgroup.Group
 	Ctx        context.Context
@@ -52,6 +66,21 @@ func ListeningStackRenderer(streamer StackSubscriber, stackName, description str
 	return listeningStackComponent(streamer, stackName, description, resourceDescriptions, opts)
 }
 
+// ListeningStackSetRenderer renders a component that listens for CloudFormation stack set events until the streamer stops.
+func ListeningStackSetRenderer(streamer StackSetSubscriber, title string, opts RenderOptions) DynamicRenderer {
+	comp := &stackSetComponent{
+		stream:    streamer.Subscribe(),
+		done:      make(chan struct{}),
+		style:     opts,
+		title:     title,
+		separator: '\t',
+		statuses:  []cfnStatus{notStartedStackStatus},
+		stopWatch: newStopWatch(),
+	}
+	go comp.Listen()
+	return comp
+}
+
 // ListeningResourceRenderer returns a tab-separated component that listens for
 // CloudFormation stack events for a particular resource.
 func ListeningResourceRenderer(streamer StackSubscriber, logicalID, description string, opts ResourceRendererOpts) DynamicRenderer {
@@ -60,7 +89,7 @@ func ListeningResourceRenderer(streamer StackSubscriber, logicalID, description 
 
 // ListeningECSServiceResourceRenderer is a ListeningResourceRenderer for the ECS service cloudformation resource
 // and a ListeningRollingUpdateRenderer to render deployments.
-func ListeningECSServiceResourceRenderer(streamer StackSubscriber, ecsDescriber stream.ECSServiceDescriber, logicalID, description string, opts ECSServiceRendererOpts) DynamicRenderer {
+func ListeningECSServiceResourceRenderer(cfg ECSServiceRendererCfg, opts ECSServiceRendererOpts) DynamicRenderer {
 	g := new(errgroup.Group)
 	ctx := context.Background()
 	if opts.Group != nil {
@@ -70,14 +99,14 @@ func ListeningECSServiceResourceRenderer(streamer StackSubscriber, ecsDescriber 
 		ctx = opts.Ctx
 	}
 	comp := &ecsServiceResourceComponent{
-		cfnStream:    streamer.Subscribe(),
-		ecsDescriber: ecsDescriber,
-		logicalID:    logicalID,
-
-		group:      g,
-		ctx:        ctx,
-		renderOpts: opts.RenderOpts,
-		resourceRenderer: ListeningResourceRenderer(streamer, logicalID, description, ResourceRendererOpts{
+		cfnStream:    cfg.Streamer.Subscribe(),
+		ecsDescriber: cfg.ECSClient,
+		cwDescriber:  cfg.CWClient,
+		logicalID:    cfg.LogicalID,
+		group:        g,
+		ctx:          ctx,
+		renderOpts:   opts.RenderOpts,
+		resourceRenderer: ListeningResourceRenderer(cfg.Streamer, cfg.LogicalID, cfg.Description, ResourceRendererOpts{
 			RenderOpts: opts.RenderOpts,
 		}),
 		done: make(chan struct{}),
@@ -89,10 +118,10 @@ func ListeningECSServiceResourceRenderer(streamer StackSubscriber, ecsDescriber 
 
 // regularResourceComponent can display a simple CloudFormation stack resource event.
 type regularResourceComponent struct {
-	logicalID   string        // The LogicalID defined in the template for the resource.
-	description string        // The human friendly explanation of the resource.
-	statuses    []stackStatus // In-order history of the CloudFormation status of the resource throughout the deployment.
-	stopWatch   *stopWatch    // Timer to measure how long the operation takes to complete.
+	logicalID   string      // The LogicalID defined in the template for the resource.
+	description string      // The human friendly explanation of the resource.
+	statuses    []cfnStatus // In-order history of the CloudFormation status of the resource throughout the deployment.
+	stopWatch   *stopWatch  // Timer to measure how long the operation takes to complete.
 
 	padding   int  // Leading spaces before rendering the resource.
 	separator rune // Character used to separate columns of text.
@@ -106,15 +135,18 @@ func listeningResourceComponent(streamer StackSubscriber, logicalID, description
 	comp := &regularResourceComponent{
 		logicalID:   logicalID,
 		description: description,
-		statuses:    []stackStatus{notStartedStackStatus},
+		statuses:    []cfnStatus{notStartedStackStatus},
 		stopWatch:   newStopWatch(),
 		stream:      streamer.Subscribe(),
 		done:        make(chan struct{}),
 		padding:     opts.RenderOpts.Padding,
 		separator:   '\t',
 	}
-	if opts.StartEvent != nil {
-		updateComponentStatus(&comp.mu, &comp.statuses, *opts.StartEvent)
+	if startEvent := opts.StartEvent; startEvent != nil {
+		updateComponentStatus(&comp.mu, &comp.statuses, cfnStatus{
+			value:  cloudformation.StackStatus(startEvent.ResourceStatus),
+			reason: startEvent.ResourceStatusReason,
+		})
 		updateComponentTimer(&comp.mu, comp.statuses, comp.stopWatch)
 	}
 	go comp.Listen()
@@ -127,7 +159,10 @@ func (c *regularResourceComponent) Listen() {
 		if c.logicalID != ev.LogicalResourceID {
 			continue
 		}
-		updateComponentStatus(&c.mu, &c.statuses, ev)
+		updateComponentStatus(&c.mu, &c.statuses, cfnStatus{
+			value:  cloudformation.StackStatus(ev.ResourceStatus),
+			reason: ev.ResourceStatusReason,
+		})
 		updateComponentTimer(&c.mu, c.statuses, c.stopWatch)
 	}
 	close(c.done) // No more events will be processed.
@@ -138,7 +173,7 @@ func (c *regularResourceComponent) Render(out io.Writer) (numLines int, err erro
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	components := stackResourceComponents(c.description, c.separator, c.statuses, c.stopWatch, c.padding)
+	components := cfnLineItemComponents(c.description, c.separator, c.statuses, c.stopWatch, c.padding)
 	return renderComponents(out, components)
 }
 
@@ -206,6 +241,12 @@ func (c *stackComponent) Listen() {
 		}
 		c.addRenderer(ev, description)
 	}
+	// Close the done channel once all the renderers are done listening.
+	for _, r := range c.resources {
+		if dr, ok := r.(DynamicRenderer); ok {
+			<-dr.Done()
+		}
+	}
 	close(c.done)
 }
 
@@ -233,11 +274,52 @@ func (c *stackComponent) addResourceRenderer(ev stream.StackEvent, description s
 	c.resources = append(c.resources, ListeningResourceRenderer(c.stack, ev.LogicalResourceID, description, opts))
 }
 
+// stackSetComponent is a DynamicRenderer that can display stack set operation events.
+type stackSetComponent struct {
+	stream <-chan stream.StackSetOpEvent
+	done   chan struct{}
+
+	style     RenderOptions
+	title     string
+	separator rune
+
+	mu        sync.Mutex
+	statuses  []cfnStatus
+	stopWatch *stopWatch
+}
+
+// Listen consumes stack set operation events and updates the status until the streamer closes the channel.
+func (c *stackSetComponent) Listen() {
+	for ev := range c.stream {
+		updateComponentStatus(&c.mu, &c.statuses, cfnStatus{
+			value:  ev.Operation.Status,
+			reason: ev.Operation.Reason,
+		})
+		updateComponentTimer(&c.mu, c.statuses, c.stopWatch)
+	}
+	close(c.done)
+}
+
+// Render renders the stack set status updates to out and returns the total number of lines written and error if any.
+func (c *stackSetComponent) Render(out io.Writer) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	components := cfnLineItemComponents(c.title, c.separator, c.statuses, c.stopWatch, c.style.Padding)
+	return renderComponents(out, components)
+}
+
+// Done returns a channel that's closed when there are no more events to Listen.
+func (c *stackSetComponent) Done() <-chan struct{} {
+	return c.done
+}
+
 // ecsServiceResourceComponent can display an ECS service created with CloudFormation.
 type ecsServiceResourceComponent struct {
 	// Required inputs.
 	cfnStream    <-chan stream.StackEvent   // Subscribed stream to initialize the deploymentRenderer.
 	ecsDescriber stream.ECSServiceDescriber // Client needed to create an ECSDeploymentStreamer.
+	cwDescriber  stream.CloudWatchDescriber // Client needed to create a CloudwatchAlarmStreamer.
 	logicalID    string                     // LogicalID for the service.
 
 	// Optional inputs.
@@ -326,7 +408,7 @@ func (c *ecsServiceResourceComponent) Done() <-chan struct{} {
 
 func (c *ecsServiceResourceComponent) newListeningRollingUpdateRenderer(serviceARN string, startTime time.Time) DynamicRenderer {
 	cluster, service := parseServiceARN(serviceARN)
-	streamer := stream.NewECSDeploymentStreamer(c.ecsDescriber, cluster, service, startTime)
+	streamer := stream.NewECSDeploymentStreamer(c.ecsDescriber, c.cwDescriber, cluster, service, startTime)
 	renderer := ListeningRollingUpdateRenderer(streamer, NestedRenderOptions(c.renderOpts))
 	c.group.Go(func() error {
 		return stream.Stream(c.ctx, streamer)
@@ -334,17 +416,14 @@ func (c *ecsServiceResourceComponent) newListeningRollingUpdateRenderer(serviceA
 	return renderer
 }
 
-func updateComponentStatus(mu *sync.Mutex, statuses *[]stackStatus, event stream.StackEvent) {
+func updateComponentStatus(mu *sync.Mutex, statuses *[]cfnStatus, newStatus cfnStatus) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	*statuses = append(*statuses, stackStatus{
-		value:  cloudformation.StackStatus(event.ResourceStatus),
-		reason: event.ResourceStatusReason,
-	})
+	*statuses = append(*statuses, newStatus)
 }
 
-func updateComponentTimer(mu *sync.Mutex, statuses []stackStatus, sw *stopWatch) {
+func updateComponentTimer(mu *sync.Mutex, statuses []cfnStatus, sw *stopWatch) {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -369,7 +448,7 @@ func updateComponentTimer(mu *sync.Mutex, statuses []stackStatus, sw *stopWatch)
 	}
 }
 
-func stackResourceComponents(description string, separator rune, statuses []stackStatus, sw *stopWatch, padding int) []Renderer {
+func cfnLineItemComponents(description string, separator rune, statuses []cfnStatus, sw *stopWatch, padding int) []Renderer {
 	columns := []string{fmt.Sprintf("- %s", description), prettifyLatestStackStatus(statuses), prettifyElapsedTime(sw)}
 	components := []Renderer{
 		&singleLineComponent{

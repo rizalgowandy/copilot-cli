@@ -57,8 +57,8 @@ func TestSvcStatus_Ask(t *testing.T) {
 				)
 				m.sel.EXPECT().DeployedService(svcStatusNamePrompt, svcStatusNameHelpPrompt, "phonetool", gomock.Any(), gomock.Any()).
 					Return(&selector.DeployedService{
-						Env: "test",
-						Svc: "api",
+						Env:  "test",
+						Name: "api",
 					}, nil) // Let prompter handles the case when svc(env) is definite.
 			},
 			wantedApp: testAppName,
@@ -69,14 +69,14 @@ func TestSvcStatus_Ask(t *testing.T) {
 			inputEnv: testEnvName,
 			inputSvc: testSvcName,
 			setupMocks: func(m svcStatusAskMock) {
-				m.sel.EXPECT().Application(svcAppNamePrompt, svcAppNameHelpPrompt).Return("phonetool", nil)
+				m.sel.EXPECT().Application(svcAppNamePrompt, wkldAppNameHelpPrompt).Return("phonetool", nil)
 				m.store.EXPECT().GetApplication(gomock.Any()).Times(0)
 				m.store.EXPECT().GetEnvironment(gomock.Any(), gomock.Any()).AnyTimes()
 				m.store.EXPECT().GetService(gomock.Any(), gomock.Any()).AnyTimes()
 				m.sel.EXPECT().DeployedService(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 					Return(&selector.DeployedService{
-						Env: testEnvName,
-						Svc: testSvcName,
+						Env:  testEnvName,
+						Name: testSvcName,
 					}, nil).AnyTimes()
 			},
 			wantedApp: testAppName,
@@ -85,7 +85,7 @@ func TestSvcStatus_Ask(t *testing.T) {
 		},
 		"errors if failed to select application": {
 			setupMocks: func(m svcStatusAskMock) {
-				m.sel.EXPECT().Application(svcAppNamePrompt, svcAppNameHelpPrompt).Return("", errors.New("some error"))
+				m.sel.EXPECT().Application(svcAppNamePrompt, wkldAppNameHelpPrompt).Return("", errors.New("some error"))
 			},
 			wantedError: fmt.Errorf("select application: some error"),
 		},
@@ -97,8 +97,8 @@ func TestSvcStatus_Ask(t *testing.T) {
 				m.store.EXPECT().GetService(gomock.Any(), gomock.Any()).Times(0)
 				m.sel.EXPECT().DeployedService(svcStatusNamePrompt, svcStatusNameHelpPrompt, testAppName, gomock.Any(), gomock.Any()).
 					Return(&selector.DeployedService{
-						Env: testEnvName,
-						Svc: testSvcName,
+						Env:  testEnvName,
+						Name: testSvcName,
 					}, nil)
 			},
 			wantedApp: testAppName,

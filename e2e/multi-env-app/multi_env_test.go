@@ -6,8 +6,9 @@ package multi_env_app_test
 import (
 	"fmt"
 	"net/http"
+	"os"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"github.com/aws/copilot-cli/e2e/internal/client"
@@ -18,7 +19,7 @@ var (
 )
 
 var _ = Describe("Multiple Env App", func() {
-	Context("when creating a new app", func() {
+	Context("when creating a new app", Ordered, func() {
 		BeforeAll(func() {
 			_, initErr = cli.AppInit(&client.AppInitRequest{
 				AppName: appName,
@@ -48,7 +49,7 @@ var _ = Describe("Multiple Env App", func() {
 		})
 	})
 
-	Context("when adding cross account environments", func() {
+	Context("when adding cross account environments", Ordered, func() {
 		var (
 			testEnvInitErr error
 			prodEnvInitErr error
@@ -57,22 +58,27 @@ var _ = Describe("Multiple Env App", func() {
 			_, testEnvInitErr = cli.EnvInit(&client.EnvInitRequest{
 				AppName: appName,
 				EnvName: "test",
-				Profile: testEnvironmentProfile,
-				Prod:    false,
+				Profile: "test",
 			})
 
 			_, prodEnvInitErr = cli.EnvInit(&client.EnvInitRequest{
 				AppName: appName,
 				EnvName: "prod",
-				Profile: prodEnvironmentProfile,
-				Prod:    true,
+				Profile: "prod",
 			})
 
 		})
 
 		It("env init should succeed for test and prod envs", func() {
+			fmt.Println(testEnvInitErr)
+			fmt.Println(prodEnvInitErr)
 			Expect(testEnvInitErr).NotTo(HaveOccurred())
 			Expect(prodEnvInitErr).NotTo(HaveOccurred())
+		})
+
+		It("should create environment manifests", func() {
+			Expect("./copilot/environments/test/manifest.yml").Should(BeAnExistingFile())
+			Expect("./copilot/environments/prod/manifest.yml").Should(BeAnExistingFile())
 		})
 
 		It("env ls should list both envs", func() {
@@ -87,19 +93,59 @@ var _ = Describe("Multiple Env App", func() {
 			}
 
 			Expect(envs["test"]).NotTo(BeNil())
-			Expect(envs["test"].Prod).To(BeFalse())
-
 			Expect(envs["prod"]).NotTo(BeNil())
-			Expect(envs["prod"].Prod).To(BeTrue())
 
 			// Make sure, for the sake of coverage, these are cross account,
-			// cross region environments.
-			Expect(envs["test"].Region).NotTo(Equal(envs["prod"].Region))
-			Expect(envs["test"].Account).NotTo(Equal(envs["prod"].Account))
+			// cross region environments if we're not doing a dryrun.
+			if os.Getenv("DRYRUN") != "true" {
+				Expect(envs["test"].Region).NotTo(Equal(envs["prod"].Region))
+				Expect(envs["test"].Account).NotTo(Equal(envs["prod"].Account))
+			}
+		})
+
+		It("should show only bootstrap resources in env show", func() {
+			testEnvShowOutput, testEnvShowError := cli.EnvShow(&client.EnvShowRequest{
+				AppName: appName,
+				EnvName: "test",
+			})
+			prodEnvShowOutput, prodEnvShowError := cli.EnvShow(&client.EnvShowRequest{
+				AppName: appName,
+				EnvName: "prod",
+			})
+			Expect(testEnvShowError).NotTo(HaveOccurred())
+			Expect(prodEnvShowError).NotTo(HaveOccurred())
+
+			Expect(testEnvShowOutput.Environment.Name).To(Equal("test"))
+			Expect(testEnvShowOutput.Environment.App).To(Equal(appName))
+			Expect(prodEnvShowOutput.Environment.Name).To(Equal("prod"))
+			Expect(prodEnvShowOutput.Environment.App).To(Equal(appName))
+
+			// Contains only bootstrap resources - two IAM roles.
+			Expect(len(testEnvShowOutput.Resources)).To(Equal(2))
+			Expect(len(prodEnvShowOutput.Resources)).To(Equal(2))
 		})
 	})
 
-	Context("when adding a svc", func() {
+	Context("when deploying the environments", Ordered, func() {
+		var testEnvDeployErr, prodEnvDeployErr error
+		BeforeAll(func() {
+			_, testEnvDeployErr = cli.EnvDeploy(&client.EnvDeployRequest{
+				AppName: appName,
+				Name:    "test",
+			})
+			_, prodEnvDeployErr = cli.EnvDeploy(&client.EnvDeployRequest{
+				AppName: appName,
+				Name:    "prod",
+			})
+		})
+
+		It("should succeed", func() {
+			Expect(testEnvDeployErr).NotTo(HaveOccurred())
+			Expect(prodEnvDeployErr).NotTo(HaveOccurred())
+		})
+	})
+
+	Context("when adding a svc", Ordered, func() {
 		var (
 			frontEndInitErr error
 		)
@@ -132,7 +178,7 @@ var _ = Describe("Multiple Env App", func() {
 		})
 	})
 
-	Context("when deploying a svc to test and prod envs", func() {
+	Context("when deploying a svc to test and prod envs", Ordered, func() {
 		var (
 			testDeployErr    error
 			prodEndDeployErr error
@@ -172,14 +218,14 @@ var _ = Describe("Multiple Env App", func() {
 			}
 
 			Expect(len(svc.ServiceDiscoveries)).To(Equal(2))
-			var envs, namespaces, wantedNamespaces []string
+			var envs, endpoints, wantedEndpoints []string
 			for _, sd := range svc.ServiceDiscoveries {
 				envs = append(envs, sd.Environment[0])
-				namespaces = append(namespaces, sd.Namespace)
-				wantedNamespaces = append(wantedNamespaces, fmt.Sprintf("%s.%s.%s.local:80", svc.SvcName, sd.Environment[0], appName))
+				endpoints = append(endpoints, sd.Endpoint)
+				wantedEndpoints = append(wantedEndpoints, fmt.Sprintf("%s.%s.%s.local:80", svc.SvcName, sd.Environment[0], appName))
 			}
 			Expect(envs).To(ConsistOf("test", "prod"))
-			Expect(namespaces).To(ConsistOf(wantedNamespaces))
+			Expect(endpoints).To(ConsistOf(wantedEndpoints))
 
 			// Call each environment's endpoint and ensure it returns a 200
 			for _, env := range []string{"test", "prod"} {
@@ -238,11 +284,11 @@ var _ = Describe("Multiple Env App", func() {
 				envs[envShowOutput.Environment.Name] = envShowOutput.Environment
 			}
 			Expect(envs["test"]).NotTo(BeNil())
-			Expect(envs["test"].Prod).To(BeFalse())
 			Expect(envs["prod"]).NotTo(BeNil())
-			Expect(envs["prod"].Prod).To(BeTrue())
-			Expect(envs["test"].Region).NotTo(Equal(envs["prod"].Region))
-			Expect(envs["test"].Account).NotTo(Equal(envs["prod"].Account))
+			if os.Getenv("DRYRUN") != "true" {
+				Expect(envs["test"].Region).NotTo(Equal(envs["prod"].Region))
+				Expect(envs["test"].Account).NotTo(Equal(envs["prod"].Account))
+			}
 			Expect(envs["test"].ExecutionRole).NotTo(Equal(envs["prod"].ExecutionRole))
 			Expect(envs["test"].ManagerRole).NotTo(Equal(envs["prod"].ExecutionRole))
 		})

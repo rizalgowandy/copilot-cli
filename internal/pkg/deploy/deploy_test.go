@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws/arn"
-	"github.com/aws/copilot-cli/internal/pkg/manifest"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 
 	rg "github.com/aws/copilot-cli/internal/pkg/aws/resourcegroups"
 	"github.com/aws/copilot-cli/internal/pkg/config"
@@ -19,7 +19,7 @@ import (
 )
 
 type storeMock struct {
-	rgGetter    *mocks.MockresourceGetter
+	rgGetter    *mocks.MockResourceGetter
 	configStore *mocks.MockConfigStoreClient
 }
 
@@ -90,17 +90,17 @@ func TestStore_ListDeployedServices(t *testing.T) {
 						{
 							App:  "mockApp",
 							Name: "mockSvc1",
-							Type: manifest.LoadBalancedWebServiceType,
+							Type: manifestinfo.LoadBalancedWebServiceType,
 						},
 						{
 							App:  "mockApp",
 							Name: "mockSvc2",
-							Type: manifest.RequestDrivenWebServiceType,
+							Type: manifestinfo.RequestDrivenWebServiceType,
 						},
 						{
 							App:  "mockApp",
 							Name: "mockJob",
-							Type: manifest.ScheduledJobType,
+							Type: manifestinfo.ScheduledJobType,
 						},
 					}, nil),
 					m.rgGetter.EXPECT().GetResourcesByTags(stackResourceType, map[string]string{
@@ -121,7 +121,7 @@ func TestStore_ListDeployedServices(t *testing.T) {
 			defer ctrl.Finish()
 
 			mockConfigStore := mocks.NewMockConfigStoreClient(ctrl)
-			mockRgGetter := mocks.NewMockresourceGetter(ctrl)
+			mockRgGetter := mocks.NewMockResourceGetter(ctrl)
 
 			mocks := storeMock{
 				rgGetter:    mockRgGetter,
@@ -132,7 +132,7 @@ func TestStore_ListDeployedServices(t *testing.T) {
 
 			store := &Store{
 				configStore:        mockConfigStore,
-				newRgClientFromIDs: func(string, string) (resourceGetter, error) { return mockRgGetter, nil },
+				newRgClientFromIDs: func(string, string) (ResourceGetter, error) { return mockRgGetter, nil },
 			}
 
 			// WHEN
@@ -168,22 +168,22 @@ func TestStore_ListDeployedJobs(t *testing.T) {
 						{
 							App:  "mockApp",
 							Name: "mockSvc1",
-							Type: manifest.LoadBalancedWebServiceType,
+							Type: manifestinfo.LoadBalancedWebServiceType,
 						},
 						{
 							App:  "mockApp",
 							Name: "mockSvc2",
-							Type: manifest.RequestDrivenWebServiceType,
+							Type: manifestinfo.RequestDrivenWebServiceType,
 						},
 						{
 							App:  "mockApp",
 							Name: "mockJob1",
-							Type: manifest.ScheduledJobType,
+							Type: manifestinfo.ScheduledJobType,
 						},
 						{
 							App:  "mockApp",
 							Name: "mockJob2",
-							Type: manifest.ScheduledJobType,
+							Type: manifestinfo.ScheduledJobType,
 						},
 					}, nil),
 					m.rgGetter.EXPECT().GetResourcesByTags(stackResourceType, map[string]string{
@@ -217,7 +217,7 @@ func TestStore_ListDeployedJobs(t *testing.T) {
 			defer ctrl.Finish()
 
 			mockConfigStore := mocks.NewMockConfigStoreClient(ctrl)
-			mockRgGetter := mocks.NewMockresourceGetter(ctrl)
+			mockRgGetter := mocks.NewMockResourceGetter(ctrl)
 
 			mocks := storeMock{
 				rgGetter:    mockRgGetter,
@@ -228,7 +228,7 @@ func TestStore_ListDeployedJobs(t *testing.T) {
 
 			store := &Store{
 				configStore:        mockConfigStore,
-				newRgClientFromIDs: func(string, string) (resourceGetter, error) { return mockRgGetter, nil },
+				newRgClientFromIDs: func(string, string) (ResourceGetter, error) { return mockRgGetter, nil },
 			}
 			// WHEN
 			jobs, err := store.ListDeployedJobs(tc.inputApp, tc.inputEnv)
@@ -324,7 +324,7 @@ func TestStore_ListEnvironmentsDeployedTo(t *testing.T) {
 			defer ctrl.Finish()
 
 			mockConfigStore := mocks.NewMockConfigStoreClient(ctrl)
-			mockRgGetter := mocks.NewMockresourceGetter(ctrl)
+			mockRgGetter := mocks.NewMockResourceGetter(ctrl)
 
 			mocks := storeMock{
 				rgGetter:    mockRgGetter,
@@ -335,7 +335,7 @@ func TestStore_ListEnvironmentsDeployedTo(t *testing.T) {
 
 			store := &Store{
 				configStore:         mockConfigStore,
-				newRgClientFromRole: func(string, string) (resourceGetter, error) { return mockRgGetter, nil },
+				newRgClientFromRole: func(string, string) (ResourceGetter, error) { return mockRgGetter, nil },
 			}
 
 			// WHEN
@@ -421,7 +421,7 @@ func TestStore_IsServiceDeployed(t *testing.T) {
 			defer ctrl.Finish()
 
 			mockConfigStore := mocks.NewMockConfigStoreClient(ctrl)
-			mockRgGetter := mocks.NewMockresourceGetter(ctrl)
+			mockRgGetter := mocks.NewMockResourceGetter(ctrl)
 
 			mocks := storeMock{
 				rgGetter:    mockRgGetter,
@@ -432,7 +432,7 @@ func TestStore_IsServiceDeployed(t *testing.T) {
 
 			store := &Store{
 				configStore:        mockConfigStore,
-				newRgClientFromIDs: func(string, string) (resourceGetter, error) { return mockRgGetter, nil },
+				newRgClientFromIDs: func(string, string) (ResourceGetter, error) { return mockRgGetter, nil },
 			}
 
 			// WHEN
@@ -516,7 +516,7 @@ func Test_IsJobDeployed(t *testing.T) {
 			defer ctrl.Finish()
 
 			mockConfigStore := mocks.NewMockConfigStoreClient(ctrl)
-			mockRgGetter := mocks.NewMockresourceGetter(ctrl)
+			mockRgGetter := mocks.NewMockResourceGetter(ctrl)
 
 			mocks := storeMock{
 				rgGetter:    mockRgGetter,
@@ -527,7 +527,7 @@ func Test_IsJobDeployed(t *testing.T) {
 
 			store := &Store{
 				configStore:        mockConfigStore,
-				newRgClientFromIDs: func(string, string) (resourceGetter, error) { return mockRgGetter, nil },
+				newRgClientFromIDs: func(string, string) (ResourceGetter, error) { return mockRgGetter, nil },
 			}
 
 			// WHEN
@@ -661,7 +661,7 @@ func TestStore_ListSNSTopics(t *testing.T) {
 			defer ctrl.Finish()
 
 			mockConfigStore := mocks.NewMockConfigStoreClient(ctrl)
-			mockRgGetter := mocks.NewMockresourceGetter(ctrl)
+			mockRgGetter := mocks.NewMockResourceGetter(ctrl)
 
 			mocks := storeMock{
 				rgGetter:    mockRgGetter,
@@ -672,7 +672,7 @@ func TestStore_ListSNSTopics(t *testing.T) {
 
 			store := &Store{
 				configStore:        mockConfigStore,
-				newRgClientFromIDs: func(string, string) (resourceGetter, error) { return mockRgGetter, nil },
+				newRgClientFromIDs: func(string, string) (ResourceGetter, error) { return mockRgGetter, nil },
 			}
 
 			// WHEN
@@ -764,7 +764,7 @@ func TestPipelineStore_ListDeployedPipelines(t *testing.T) {
 			ctrl := gomock.NewController(t)
 			defer ctrl.Finish()
 
-			mockRgGetter := mocks.NewMockresourceGetter(ctrl)
+			mockRgGetter := mocks.NewMockResourceGetter(ctrl)
 
 			mocks := storeMock{
 				rgGetter: mockRgGetter,
@@ -773,12 +773,11 @@ func TestPipelineStore_ListDeployedPipelines(t *testing.T) {
 			tc.setupMocks(mocks)
 
 			store := &PipelineStore{
-				appName: mockAppName,
-				getter:  mocks.rgGetter,
+				getter: mocks.rgGetter,
 			}
 
 			// WHEN
-			pipelines, err := store.ListDeployedPipelines()
+			pipelines, err := store.ListDeployedPipelines(mockAppName)
 
 			// THEN
 			if tc.wantedError != nil {

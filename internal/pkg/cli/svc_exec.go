@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -22,7 +22,6 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/ecs"
 	"github.com/aws/copilot-cli/internal/pkg/exec"
-	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
 	"github.com/aws/copilot-cli/internal/pkg/term/log"
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
@@ -55,7 +54,7 @@ type svcExecOpts struct {
 	newCommandExecutor func(*session.Session) ecsCommandExecutor
 	ssmPluginManager   ssmPluginManager
 	prompter           prompter
-	sessProvider       *sessions.Provider
+	sessProvider       sessionProvider
 	// Override in unit test
 	randInt func(int) int
 }
@@ -82,7 +81,6 @@ func newSvcExecOpts(vars execVars) (*svcExecOpts, error) {
 			return awsecs.New(s)
 		},
 		randInt: func(x int) int {
-			rand.Seed(time.Now().Unix())
 			return rand.Intn(x)
 		},
 		ssmPluginManager: exec.NewSSMPluginCommand(nil),
@@ -113,8 +111,8 @@ func (o *svcExecOpts) Execute() error {
 	if err != nil {
 		return fmt.Errorf("get workload: %w", err)
 	}
-	if wkld.Type == manifest.RequestDrivenWebServiceType {
-		return fmt.Errorf("executing a command in a running container part of a service is not supported for services with type: '%s'", manifest.RequestDrivenWebServiceType)
+	if wkld.Type == manifestinfo.RequestDrivenWebServiceType {
+		return fmt.Errorf("executing a command in a running container part of a service is not supported for services with type: '%s'", manifestinfo.RequestDrivenWebServiceType)
 	}
 	sess, err := o.envSession()
 	if err != nil {
@@ -151,7 +149,7 @@ func (o *svcExecOpts) validateOrAskApp() error {
 		_, err := o.store.GetApplication(o.appName)
 		return err
 	}
-	app, err := o.sel.Application(svcAppNamePrompt, svcAppNameHelpPrompt)
+	app, err := o.sel.Application(svcAppNamePrompt, wkldAppNameHelpPrompt)
 	if err != nil {
 		return fmt.Errorf("select application: %w", err)
 	}
@@ -174,11 +172,11 @@ func (o *svcExecOpts) validateAndAskSvcEnvName() error {
 
 	// Note: we let prompter handle the case when there is only option for user to choose from.
 	// This is naturally the case when `o.envName != "" && o.name != ""`.
-	deployedService, err := o.sel.DeployedService(svcExecNamePrompt, svcExecNameHelpPrompt, o.appName, selector.WithEnv(o.envName), selector.WithSvc(o.name))
+	deployedService, err := o.sel.DeployedService(svcExecNamePrompt, svcExecNameHelpPrompt, o.appName, selector.WithEnv(o.envName), selector.WithName(o.name))
 	if err != nil {
 		return fmt.Errorf("select deployed service for application %s: %w", o.appName, err)
 	}
-	o.name = deployedService.Svc
+	o.name = deployedService.Name
 	o.envName = deployedService.Env
 	return nil
 }

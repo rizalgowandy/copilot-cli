@@ -1,5 +1,5 @@
 # app show
-```bash
+```console
 $ copilot app show [flags]
 ```
 
@@ -9,15 +9,15 @@ $ copilot app show [flags]
 
 ## What are the flags?
 
-```bash
+```
 -h, --help          help for show
-    --json          Optional. Outputs in JSON format.
+    --json          Optional. Output in JSON format.
 -n, --name string   Name of the application.
 ```
 
 ## Examples
 Shows info about the application "my-app".
-```bash
+```console
 $ copilot app show -n my-app
 ```
 

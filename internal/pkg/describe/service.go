@@ -4,21 +4,22 @@
 package describe
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"sort"
+	"strings"
 
-	"github.com/aws/copilot-cli/internal/pkg/ecs"
-
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/arn"
 	"github.com/aws/copilot-cli/internal/pkg/aws/apprunner"
+	"github.com/aws/copilot-cli/internal/pkg/aws/cloudwatch"
 	awsecs "github.com/aws/copilot-cli/internal/pkg/aws/ecs"
-
-	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
 	"github.com/aws/copilot-cli/internal/pkg/config"
-	cfnstack "github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
 	"github.com/aws/copilot-cli/internal/pkg/describe/stack"
+	"github.com/aws/copilot-cli/internal/pkg/ecs"
 )
 
 const (
@@ -28,7 +29,12 @@ const (
 	waitConditionHandle  = "AWS::CloudFormation::WaitConditionHandle"
 )
 
-const apprunnerServiceType = "AWS::AppRunner::Service"
+const (
+	apprunnerServiceType              = "AWS::AppRunner::Service"
+	apprunnerVPCIngressConnectionType = "AWS::AppRunner::VpcIngressConnection"
+)
+
+const maxAlarmShowColumnWidth = 40
 
 // ConfigStoreSvc wraps methods of config store.
 type ConfigStoreSvc interface {
@@ -48,57 +54,82 @@ type DeployedEnvServicesLister interface {
 
 type ecsClient interface {
 	TaskDefinition(app, env, svc string) (*awsecs.TaskDefinition, error)
+	Service(app, env, svc string) (*awsecs.Service, error)
 }
 
 type apprunnerClient interface {
-	DescribeService(svcArn string) (*apprunner.Service, error)
+	DescribeService(svcARN string) (*apprunner.Service, error)
+	PrivateURL(vicARN string) (string, error)
 }
 
-type workloadStackDescriber interface {
+type workloadDescriber interface {
 	Params() (map[string]string, error)
 	Outputs() (map[string]string, error)
-	ServiceStackResources() ([]*stack.Resource, error)
+	StackResources() ([]*stack.Resource, error)
+	Manifest() ([]byte, error)
 }
 
 type ecsDescriber interface {
-	workloadStackDescriber
-
+	workloadDescriber
+	ServiceConnectDNSNames() ([]string, error)
 	Platform() (*awsecs.ContainerPlatform, error)
 	EnvVars() ([]*awsecs.ContainerEnvVar, error)
 	Secrets() ([]*awsecs.ContainerSecret, error)
+	RollbackAlarmNames() ([]string, error)
 }
 
 type apprunnerDescriber interface {
-	workloadStackDescriber
+	workloadDescriber
 
 	Service() (*apprunner.Service, error)
 	ServiceARN() (string, error)
 	ServiceURL() (string, error)
+	IsPrivate() (bool, error)
 }
 
-// serviceStackDescriber provides base functionality for retrieving info about a service.
-type serviceStackDescriber struct {
-	app     string
-	service string
-	env     string
-
-	cfn  stackDescriber
-	sess *session.Session
+type cwAlarmDescriber interface {
+	AlarmDescriptions([]string) ([]*cloudwatch.AlarmDescription, error)
 }
 
-// ECSServiceDescriber retrieves information about a non-App Runner service.
-type ECSServiceDescriber struct {
-	*serviceStackDescriber
+type bucketDescriber interface {
+	BucketTree(bucket string) (string, error)
+}
+
+type bucketDataGetter interface {
+	BucketSizeAndCount(bucket string) (string, int, error)
+}
+
+type bucketNameGetter interface {
+	BucketName(app, env, svc string) (string, error)
+}
+
+type ecsSvcDesc struct {
+	Service           string                         `json:"service"`
+	Type              string                         `json:"type"`
+	App               string                         `json:"application"`
+	Configurations    ecsConfigurations              `json:"configurations"`
+	AlarmDescriptions []*cloudwatch.AlarmDescription `json:"rollbackAlarms,omitempty"`
+	Routes            []*WebServiceRoute             `json:"routes"`
+	ServiceDiscovery  serviceDiscoveries             `json:"serviceDiscovery"`
+	ServiceConnect    serviceConnects                `json:"serviceConnect,omitempty"`
+	Variables         containerEnvVars               `json:"variables"`
+	Secrets           secrets                        `json:"secrets,omitempty"`
+	Resources         deployedSvcResources           `json:"resources,omitempty"`
+
+	environments []string `json:"-"`
+}
+
+type ecsServiceDescriber struct {
+	*WorkloadStackDescriber
 	ecsClient ecsClient
 }
 
-// AppRunnerServiceDescriber retrieves information about an App Runner service.
-type AppRunnerServiceDescriber struct {
-	*serviceStackDescriber
+type appRunnerServiceDescriber struct {
+	*WorkloadStackDescriber
 	apprunnerClient apprunnerClient
 }
 
-// NewServiceConfig contains fields that initiates ServiceDescriber struct.
+// NewServiceConfig contains fields that initiates service describer struct.
 type NewServiceConfig struct {
 	App         string
 	Env         string
@@ -109,94 +140,62 @@ type NewServiceConfig struct {
 	DeployStore     DeployedEnvServicesLister
 }
 
-// NewECSServiceDescriber instantiates a new non-App Runner service.
-func NewECSServiceDescriber(opt NewServiceConfig) (*ECSServiceDescriber, error) {
-	stackDescriber, err := newServiceStackDescriber(opt)
+func newECSServiceDescriber(opt NewServiceConfig) (*ecsServiceDescriber, error) {
+	stackDescriber, err := NewWorkloadStackDescriber(NewWorkloadConfig{
+		App:         opt.App,
+		Env:         opt.Env,
+		Name:        opt.Svc,
+		ConfigStore: opt.ConfigStore,
+	})
 	if err != nil {
 		return nil, err
 	}
-	return &ECSServiceDescriber{
-		serviceStackDescriber: stackDescriber,
-		ecsClient:             ecs.New(stackDescriber.sess),
+	return &ecsServiceDescriber{
+		WorkloadStackDescriber: stackDescriber,
+		ecsClient:              ecs.New(stackDescriber.sess),
 	}, nil
 }
 
-// NewAppRunnerServiceDescriber instantiates a new App Runner service.
-func NewAppRunnerServiceDescriber(opt NewServiceConfig) (*AppRunnerServiceDescriber, error) {
-	stackDescriber, err := newServiceStackDescriber(opt)
+func newAppRunnerServiceDescriber(opt NewServiceConfig) (*appRunnerServiceDescriber, error) {
+	stackDescriber, err := NewWorkloadStackDescriber(NewWorkloadConfig{
+		App:         opt.App,
+		Env:         opt.Env,
+		Name:        opt.Svc,
+		ConfigStore: opt.ConfigStore,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	return &AppRunnerServiceDescriber{
-		serviceStackDescriber: stackDescriber,
-		apprunnerClient:       apprunner.New(stackDescriber.sess),
+	return &appRunnerServiceDescriber{
+		WorkloadStackDescriber: stackDescriber,
+		apprunnerClient:        apprunner.New(stackDescriber.sess),
 	}, nil
-}
-
-// Params returns the parameters of the service stack.
-func (d *serviceStackDescriber) Params() (map[string]string, error) {
-	descr, err := d.cfn.Describe()
-	if err != nil {
-		return nil, err
-	}
-	return descr.Parameters, nil
-}
-
-// Params returns the outputs of the service stack.
-func (d *serviceStackDescriber) Outputs() (map[string]string, error) {
-	descr, err := d.cfn.Describe()
-	if err != nil {
-		return nil, err
-	}
-	return descr.Outputs, nil
 }
 
 // EnvVars returns the environment variables of the task definition.
-func (d *ECSServiceDescriber) EnvVars() ([]*awsecs.ContainerEnvVar, error) {
-	taskDefinition, err := d.ecsClient.TaskDefinition(d.app, d.env, d.service)
+func (d *ecsServiceDescriber) EnvVars() ([]*awsecs.ContainerEnvVar, error) {
+	taskDefinition, err := d.ecsClient.TaskDefinition(d.app, d.env, d.name)
 	if err != nil {
-		return nil, fmt.Errorf("describe task definition for service %s: %w", d.service, err)
+		return nil, fmt.Errorf("describe task definition for service %s: %w", d.name, err)
 	}
 	return taskDefinition.EnvironmentVariables(), nil
 }
 
 // Secrets returns the secrets of the task definition.
-func (d *ECSServiceDescriber) Secrets() ([]*awsecs.ContainerSecret, error) {
-	taskDefinition, err := d.ecsClient.TaskDefinition(d.app, d.env, d.service)
+func (d *ecsServiceDescriber) Secrets() ([]*awsecs.ContainerSecret, error) {
+	taskDefinition, err := d.ecsClient.TaskDefinition(d.app, d.env, d.name)
 	if err != nil {
-		return nil, fmt.Errorf("describe task definition for service %s: %w", d.service, err)
+		return nil, fmt.Errorf("describe task definition for service %s: %w", d.name, err)
 	}
 	return taskDefinition.Secrets(), nil
 }
 
-// ServiceStackResources returns the filtered service stack resources created by CloudFormation.
-func (d *serviceStackDescriber) ServiceStackResources() ([]*stack.Resource, error) {
-	svcResources, err := d.cfn.Resources()
-	if err != nil {
-		return nil, err
-	}
-	var resources []*stack.Resource
-	ignoredResources := map[string]bool{
-		rulePriorityFunction: true,
-		waitCondition:        true,
-		waitConditionHandle:  true,
-	}
-	for _, svcResource := range svcResources {
-		if ignoredResources[svcResource.Type] {
-			continue
-		}
-		resources = append(resources, svcResource)
-	}
-
-	return resources, nil
-}
-
 // Platform returns the platform of the task definition.
-func (d *ECSServiceDescriber) Platform() (*awsecs.ContainerPlatform, error) {
-	taskDefinition, err := d.ecsClient.TaskDefinition(d.app, d.env, d.service)
+func (d *ecsServiceDescriber) Platform() (*awsecs.ContainerPlatform, error) {
+	taskDefinition, err := d.ecsClient.TaskDefinition(d.app, d.env, d.name)
 	if err != nil {
-		return nil, fmt.Errorf("describe task definition for service %s: %w", d.service, err)
+		return nil, fmt.Errorf("describe task definition for service %s: %w", d.name, err)
 	}
 	platform := taskDefinition.Platform()
 	if platform == nil {
@@ -208,14 +207,35 @@ func (d *ECSServiceDescriber) Platform() (*awsecs.ContainerPlatform, error) {
 	return platform, nil
 }
 
+// ServiceConnectDNSNames returns the service connect dns names of a service.
+func (d *ecsServiceDescriber) ServiceConnectDNSNames() ([]string, error) {
+	service, err := d.ecsClient.Service(d.app, d.env, d.name)
+	if err != nil {
+		return nil, fmt.Errorf("get service %s: %w", d.name, err)
+	}
+	return service.ServiceConnectAliases(), nil
+}
+
+// RollbackAlarmNames returns the rollback alarm names of a service.
+func (d *ecsServiceDescriber) RollbackAlarmNames() ([]string, error) {
+	service, err := d.ecsClient.Service(d.app, d.env, d.name)
+	if err != nil {
+		return nil, fmt.Errorf("get service %s: %w", d.name, err)
+	}
+	if service.DeploymentConfiguration.Alarms == nil {
+		return nil, nil
+	}
+	return aws.StringValueSlice(service.DeploymentConfiguration.Alarms.AlarmNames), nil
+}
+
 // ServiceARN retrieves the ARN of the app runner service.
-func (d *AppRunnerServiceDescriber) ServiceARN() (string, error) {
-	serviceStackResources, err := d.ServiceStackResources()
+func (d *appRunnerServiceDescriber) ServiceARN() (string, error) {
+	StackResources, err := d.StackResources()
 	if err != nil {
 		return "", err
 	}
 
-	for _, resource := range serviceStackResources {
+	for _, resource := range StackResources {
 		arn := resource.PhysicalID
 		if resource.Type == apprunnerServiceType && arn != "" {
 			return arn, nil
@@ -225,8 +245,26 @@ func (d *AppRunnerServiceDescriber) ServiceARN() (string, error) {
 	return "", fmt.Errorf("no App Runner Service in service stack")
 }
 
+// vpcIngressConnectionARN returns the ARN of the VPC Ingress Connection
+// for this service. If one does not exist, it returns errVPCIngressConnectionNotFound.
+func (d *appRunnerServiceDescriber) vpcIngressConnectionARN() (string, error) {
+	StackResources, err := d.StackResources()
+	if err != nil {
+		return "", err
+	}
+
+	for _, resource := range StackResources {
+		arn := resource.PhysicalID
+		if resource.Type == apprunnerVPCIngressConnectionType && arn != "" {
+			return arn, nil
+		}
+	}
+
+	return "", errVPCIngressConnectionNotFound
+}
+
 // Service retrieves an app runner service.
-func (d *AppRunnerServiceDescriber) Service() (*apprunner.Service, error) {
+func (d *appRunnerServiceDescriber) Service() (*apprunner.Service, error) {
 	serviceARN, err := d.ServiceARN()
 	if err != nil {
 		return nil, err
@@ -239,17 +277,44 @@ func (d *AppRunnerServiceDescriber) Service() (*apprunner.Service, error) {
 	return service, nil
 }
 
-// ServiceURL retrieves the app runner service URL.
-func (d *AppRunnerServiceDescriber) ServiceURL() (string, error) {
-	service, err := d.Service()
+// IsPrivate returns true if the service is configured as non-public.
+func (d *appRunnerServiceDescriber) IsPrivate() (bool, error) {
+	_, err := d.vpcIngressConnectionARN()
 	if err != nil {
-		return "", fmt.Errorf("retrieve service URI: %w", err)
+		if errors.Is(err, errVPCIngressConnectionNotFound) {
+			return false, nil
+		}
+
+		return false, err
 	}
 
-	return formatAppRunnerUrl(service.ServiceURL), nil
+	return true, nil
 }
 
-func formatAppRunnerUrl(serviceURL string) string {
+// ServiceURL retrieves the app runner service URL.
+func (d *appRunnerServiceDescriber) ServiceURL() (string, error) {
+	vicARN, err := d.vpcIngressConnectionARN()
+	isVICNotFound := errors.Is(err, errVPCIngressConnectionNotFound)
+	if err != nil && !isVICNotFound {
+		return "", err
+	}
+
+	if !isVICNotFound {
+		url, err := d.apprunnerClient.PrivateURL(vicARN)
+		if err != nil {
+			return "", err
+		}
+		return formatAppRunnerURL(url), nil
+	}
+
+	service, err := d.Service()
+	if err != nil {
+		return "", err
+	}
+	return formatAppRunnerURL(service.ServiceURL), nil
+}
+
+func formatAppRunnerURL(serviceURL string) string {
 	svcUrl := &url.URL{
 		Host: serviceURL,
 		// App Runner defaults to https
@@ -257,26 +322,6 @@ func formatAppRunnerUrl(serviceURL string) string {
 	}
 
 	return svcUrl.String()
-}
-
-// newServiceStackDescriber instantiates the core elements of a new service.
-func newServiceStackDescriber(opt NewServiceConfig) (*serviceStackDescriber, error) {
-	environment, err := opt.ConfigStore.GetEnvironment(opt.App, opt.Env)
-	if err != nil {
-		return nil, fmt.Errorf("get environment %s: %w", opt.Env, err)
-	}
-	sess, err := sessions.ImmutableProvider().FromRole(environment.ManagerRoleARN, environment.Region)
-	if err != nil {
-		return nil, err
-	}
-	return &serviceStackDescriber{
-		app:     opt.App,
-		service: opt.Svc,
-		env:     opt.Env,
-
-		cfn:  stack.NewStackDescriber(cfnstack.NameForService(opt.App, opt.Env, opt.Svc), sess),
-		sess: sess,
-	}, nil
 }
 
 // ServiceConfig contains serialized configuration parameters for a service.
@@ -288,6 +333,7 @@ type ServiceConfig struct {
 	Platform    string `json:"platform,omitempty"`
 }
 
+// ECSServiceConfig contains info about how an ECS-based service is configured.
 type ECSServiceConfig struct {
 	*ServiceConfig
 
@@ -316,6 +362,17 @@ func (c appRunnerConfigurations) humanString(w io.Writer) {
 	}
 
 	printTable(w, headers, rows)
+}
+
+type rollbackAlarms []*cloudwatch.AlarmDescription
+
+func (abr rollbackAlarms) humanString(w io.Writer) {
+	headers := []string{"Name", "Environment", "Description"}
+	fmt.Fprintf(w, "  %s\n", strings.Join(headers, "\t"))
+	fmt.Fprintf(w, "  %s\n", strings.Join(underline(headers), "\t"))
+	for _, alarm := range abr {
+		printWithMaxWidth(w, "  %s\t%s\t%s\n", maxAlarmShowColumnWidth, alarm.Name, alarm.Environment, alarm.Description)
+	}
 }
 
 // envVar contains serialized environment variables for a service.
@@ -360,4 +417,175 @@ func (e containerEnvVars) humanString(w io.Writer) {
 	}
 
 	printTable(w, headers, rows)
+}
+
+// rdwsSecret contains secrets for an rdws service.
+type rdwsSecret struct {
+	Environment string `json:"environment"`
+	Name        string `json:"name"`
+	ValueFrom   string `json:"value"`
+}
+
+type rdwsSecrets []*rdwsSecret
+
+func (e rdwsSecrets) humanString(w io.Writer) {
+	headers := []string{"Name", "Environment", "Value"}
+	var rows [][]string
+	sort.SliceStable(e, func(i, j int) bool {
+		if e[i].Name == e[j].Name {
+			return e[i].Environment < e[j].Environment
+		}
+		return e[i].Name < e[j].Name
+	})
+	for _, v := range e {
+		rows = append(rows, []string{v.Name, v.Environment, v.ValueFrom})
+	}
+	printTable(w, headers, rows)
+}
+
+type secret struct {
+	Name        string `json:"name"`
+	Container   string `json:"container"`
+	Environment string `json:"environment"`
+	ValueFrom   string `json:"valueFrom"`
+}
+
+type secrets []*secret
+
+func (s secrets) humanString(w io.Writer) {
+	headers := []string{"Name", "Container", "Environment", "Value From"}
+	fmt.Fprintf(w, "  %s\n", strings.Join(headers, "\t"))
+	fmt.Fprintf(w, "  %s\n", strings.Join(underline(headers), "\t"))
+	sort.SliceStable(s, func(i, j int) bool { return s[i].Environment < s[j].Environment })
+	sort.SliceStable(s, func(i, j int) bool { return s[i].Container < s[j].Container })
+	sort.SliceStable(s, func(i, j int) bool { return s[i].Name < s[j].Name })
+	if len(s) > 0 {
+		valueFrom := s[0].ValueFrom
+		if _, err := arn.Parse(s[0].ValueFrom); err != nil {
+			// If the valueFrom is not an ARN, preface it with "parameter/"
+			valueFrom = fmt.Sprintf("parameter/%s", s[0].ValueFrom)
+		}
+		fmt.Fprintf(w, "  %s\n", strings.Join([]string{s[0].Name, s[0].Container, s[0].Environment, valueFrom}, "\t"))
+	}
+	for prev, cur := 0, 1; cur < len(s); prev, cur = prev+1, cur+1 {
+		valueFrom := s[cur].ValueFrom
+		if _, err := arn.Parse(s[cur].ValueFrom); err != nil {
+			// If the valueFrom is not an ARN, preface it with "parameter/"
+			valueFrom = fmt.Sprintf("parameter/%s", s[cur].ValueFrom)
+		}
+		cols := []string{s[cur].Name, s[cur].Container, s[cur].Environment, valueFrom}
+		if s[prev].Name == s[cur].Name {
+			cols[0] = dittoSymbol
+		}
+		if s[prev].Container == s[cur].Container {
+			cols[1] = dittoSymbol
+		}
+		if s[prev].Environment == s[cur].Environment {
+			cols[2] = dittoSymbol
+		}
+		if s[prev].ValueFrom == s[cur].ValueFrom {
+			cols[3] = dittoSymbol
+		}
+		fmt.Fprintf(w, "  %s\n", strings.Join(cols, "\t"))
+	}
+}
+
+func underline(headings []string) []string {
+	var lines []string
+	for _, heading := range headings {
+		line := strings.Repeat("-", len(heading))
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// endpointToEnvs is a mapping of endpoint to environments.
+type endpointToEnvs map[string][]string
+
+func (e *endpointToEnvs) marshalJSON() ([]byte, error) {
+	type internalEndpoint struct {
+		Environment []string `json:"environment"`
+		Endpoint    string   `json:"endpoint"`
+	}
+	var internalEndpoints []internalEndpoint
+	for endpoint := range *e {
+		internalEndpoints = append(internalEndpoints, internalEndpoint{
+			Environment: (*e)[endpoint],
+			Endpoint:    endpoint,
+		})
+	}
+	sort.Slice(internalEndpoints, func(i, j int) bool { return internalEndpoints[i].Endpoint < internalEndpoints[j].Endpoint })
+	return json.Marshal(&internalEndpoints)
+}
+
+func (e endpointToEnvs) add(endpoint string, env string) {
+	e[endpoint] = append(e[endpoint], env)
+}
+
+type serviceDiscoveries endpointToEnvs
+
+// MarshalJSON overrides the default JSON marshaling logic for the serviceDiscoveries
+// struct, allowing it to perform more complex marshaling behavior.
+func (sds *serviceDiscoveries) MarshalJSON() ([]byte, error) {
+	return (*endpointToEnvs)(sds).marshalJSON()
+}
+
+func (sds *serviceDiscoveries) collectEndpoints(descr envDescriber, svc, env, port string) error {
+	endpoint, err := descr.ServiceDiscoveryEndpoint()
+	if err != nil {
+		return err
+	}
+	sd := serviceDiscovery{
+		Service:  svc,
+		Port:     port,
+		Endpoint: endpoint,
+	}
+	(*endpointToEnvs)(sds).add(sd.String(), env)
+	return nil
+}
+
+type serviceConnects endpointToEnvs
+
+// MarshalJSON overrides the default JSON marshaling logic for the serviceConnects
+// struct, allowing it to perform more complex marshaling behavior.
+func (scs *serviceConnects) MarshalJSON() ([]byte, error) {
+	return (*endpointToEnvs)(scs).marshalJSON()
+}
+
+func (scs *serviceConnects) collectEndpoints(descr ecsDescriber, env string) error {
+	scDNSNames, err := descr.ServiceConnectDNSNames()
+	if err != nil {
+		return fmt.Errorf("retrieve service connect DNS names: %w", err)
+	}
+	for _, dnsName := range scDNSNames {
+		(*endpointToEnvs)(scs).add(dnsName, env)
+	}
+	return nil
+}
+
+type serviceEndpoints struct {
+	discoveries serviceDiscoveries
+	connects    serviceConnects
+}
+
+func (s serviceEndpoints) humanString(w io.Writer) {
+	headers := []string{"Endpoint", "Environment", "Type"}
+	fmt.Fprintf(w, "  %s\n", strings.Join(headers, "\t"))
+	fmt.Fprintf(w, "  %s\n", strings.Join(underline(headers), "\t"))
+	var scEndpoints []string
+	for endpoint := range s.connects {
+		scEndpoints = append(scEndpoints, endpoint)
+	}
+	sort.Slice(scEndpoints, func(i, j int) bool { return scEndpoints[i] < scEndpoints[j] })
+	for _, endpoint := range scEndpoints {
+		fmt.Fprintf(w, "  %s\t%s\t%s\n", endpoint, strings.Join(s.connects[endpoint], ", "), "Service Connect")
+	}
+	var sdEndpoints []string
+	for endpoint := range s.discoveries {
+		sdEndpoints = append(sdEndpoints, endpoint)
+	}
+	sort.Slice(sdEndpoints, func(i, j int) bool { return sdEndpoints[i] < sdEndpoints[j] })
+	for _, endpoint := range sdEndpoints {
+		fmt.Fprintf(w, "  %s\t%s\t%s\n", endpoint, strings.Join(s.discoveries[endpoint], ", "), "Service Discovery")
+	}
 }

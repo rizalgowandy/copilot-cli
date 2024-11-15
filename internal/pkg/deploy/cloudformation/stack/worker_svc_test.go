@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/aws/copilot-cli/internal/pkg/addon"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/cloudformation"
-	"github.com/aws/copilot-cli/internal/pkg/addon"
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack/mocks"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/template"
@@ -33,54 +35,14 @@ func TestWorkerService_Template(t *testing.T) {
 		wantedTemplate   string
 		wantedErr        error
 	}{
-		"unavailable desired count lambda template": {
-			mockDependencies: func(t *testing.T, ctrl *gomock.Controller, svc *WorkerService) {
-				m := mocks.NewMockworkerSvcReadParser(ctrl)
-				m.EXPECT().Read(desiredCountGeneratorPath).Return(nil, errors.New("some error"))
-				svc.parser = m
-			},
-			wantedTemplate: "",
-			wantedErr:      fmt.Errorf("read desired count lambda function source code: some error"),
-		},
-		"unavailable env controller lambda template": {
-			mockDependencies: func(t *testing.T, ctrl *gomock.Controller, svc *WorkerService) {
-				m := mocks.NewMockworkerSvcReadParser(ctrl)
-				m.EXPECT().Read(desiredCountGeneratorPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(envControllerPath).Return(nil, errors.New("some error"))
-				svc.parser = m
-			},
-			wantedTemplate: "",
-			wantedErr:      fmt.Errorf("read env controller lambda function source code: some error"),
-		},
-		"unavailable backlog-per-task-caculator lambda template": {
-			mockDependencies: func(t *testing.T, ctrl *gomock.Controller, svc *WorkerService) {
-				m := mocks.NewMockworkerSvcReadParser(ctrl)
-				m.EXPECT().Read(desiredCountGeneratorPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(envControllerPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(backlogCalculatorLambdaPath).Return(nil, errors.New("some error"))
-				svc.parser = m
-			},
-			wantedTemplate: "",
-			wantedErr:      fmt.Errorf("read backlog-per-task-calculator lambda function source code: some error"),
-		},
 		"unexpected addons template parsing error": {
 			mockDependencies: func(t *testing.T, ctrl *gomock.Controller, svc *WorkerService) {
-				m := mocks.NewMockworkerSvcReadParser(ctrl)
-				m.EXPECT().Read(desiredCountGeneratorPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(envControllerPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(backlogCalculatorLambdaPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				svc.parser = m
 				svc.addons = mockAddons{tplErr: errors.New("some error")}
 			},
 			wantedErr: fmt.Errorf("generate addons template for %s: %w", testServiceName, errors.New("some error")),
 		},
 		"unexpected addons params parsing error": {
 			mockDependencies: func(t *testing.T, ctrl *gomock.Controller, svc *WorkerService) {
-				m := mocks.NewMockworkerSvcReadParser(ctrl)
-				m.EXPECT().Read(desiredCountGeneratorPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(envControllerPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(backlogCalculatorLambdaPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				svc.parser = m
 				svc.addons = mockAddons{paramsErr: errors.New("some error")}
 			},
 			wantedErr: fmt.Errorf("parse addons parameters for %s: %w", testServiceName, errors.New("some error")),
@@ -96,11 +58,6 @@ func TestWorkerService_Template(t *testing.T) {
 				svc.manifest = testWorkerSvcManifestWithBadSidecar
 			},
 			mockDependencies: func(t *testing.T, ctrl *gomock.Controller, svc *WorkerService) {
-				m := mocks.NewMockworkerSvcReadParser(ctrl)
-				m.EXPECT().Read(desiredCountGeneratorPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(envControllerPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(backlogCalculatorLambdaPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				svc.parser = m
 				svc.addons = mockAddons{
 					tpl: `
 Resources:
@@ -111,7 +68,7 @@ Outputs:
     Value: hello`,
 				}
 			},
-			wantedErr: fmt.Errorf("convert the sidecar configuration for service frontend: %w", errors.New("cannot parse port mapping from 80/80/80")),
+			wantedErr: fmt.Errorf("parse exposed ports in service manifest frontend: cannot parse port mapping from 80/80/80"),
 		},
 		"failed parsing Auto Scaling template": {
 			setUpManifest: func(svc *WorkerService) {
@@ -125,11 +82,6 @@ Outputs:
 				svc.manifest = testWorkerSvcManifestWithBadAutoScaling
 			},
 			mockDependencies: func(t *testing.T, ctrl *gomock.Controller, svc *WorkerService) {
-				m := mocks.NewMockworkerSvcReadParser(ctrl)
-				m.EXPECT().Read(desiredCountGeneratorPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(envControllerPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(backlogCalculatorLambdaPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				svc.parser = m
 				svc.addons = mockAddons{
 					tpl: `
 Resources:
@@ -148,9 +100,6 @@ Outputs:
 			},
 			mockDependencies: func(t *testing.T, ctrl *gomock.Controller, svc *WorkerService) {
 				m := mocks.NewMockworkerSvcReadParser(ctrl)
-				m.EXPECT().Read(desiredCountGeneratorPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(envControllerPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(backlogCalculatorLambdaPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
 				m.EXPECT().ParseWorkerService(gomock.Any()).Return(nil, errors.New("some error"))
 				svc.parser = m
 				svc.addons = mockAddons{
@@ -189,37 +138,51 @@ Outputs:
 					StringSlice: []string{"here"},
 				}
 				svc.manifest.ExecuteCommand = manifest.ExecuteCommand{Enable: aws.Bool(true)}
+				svc.manifest.DeployConfig = manifest.WorkerDeploymentConfig{
+					DeploymentControllerConfig: manifest.DeploymentControllerConfig{
+						Rolling: aws.String("default"),
+					},
+					WorkerRollbackAlarms: manifest.AdvancedToUnion[[]string, manifest.WorkerAlarmArgs](
+						manifest.WorkerAlarmArgs{
+							MessagesDelayed: aws.Int(10),
+						})}
 			},
 			mockDependencies: func(t *testing.T, ctrl *gomock.Controller, svc *WorkerService) {
 				m := mocks.NewMockworkerSvcReadParser(ctrl)
-				m.EXPECT().Read(desiredCountGeneratorPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(envControllerPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().Read(backlogCalculatorLambdaPath).Return(&template.Content{Buffer: bytes.NewBufferString("something")}, nil)
-				m.EXPECT().ParseWorkerService(template.WorkloadOpts{
-					WorkloadType: manifest.WorkerServiceType,
-					HealthCheck: &template.ContainerHealthCheck{
-						Command:     []string{"CMD-SHELL", "curl -f http://localhost/ || exit 1"},
-						Interval:    aws.Int64(5),
-						Retries:     aws.Int64(3),
-						StartPeriod: aws.Int64(0),
-						Timeout:     aws.Int64(10),
-					},
-					DesiredCountLambda:             "something",
-					EnvControllerLambda:            "something",
-					BacklogPerTaskCalculatorLambda: "something",
-					ExecuteCommand:                 &template.ExecuteCommandOpts{},
-					NestedStack: &template.WorkloadNestedStackOpts{
-						StackName:       addon.StackName,
-						VariableOutputs: []string{"MyTable"},
-					},
-					Network: template.NetworkOpts{
-						AssignPublicIP: template.DisablePublicIP,
-						SubnetsType:    template.PrivateSubnetsPlacement,
-						SecurityGroups: []string{"sg-1234"},
-					},
-					EntryPoint: []string{"enter", "from"},
-					Command:    []string{"here"},
-				}).Return(&template.Content{Buffer: bytes.NewBufferString("template")}, nil)
+				m.EXPECT().ParseWorkerService(gomock.Any()).DoAndReturn(func(actual template.WorkloadOpts) (*template.Content, error) {
+					require.Equal(t, template.WorkloadOpts{
+						AppName:      "phonetool",
+						EnvName:      "test",
+						WorkloadName: "frontend",
+						WorkloadType: manifestinfo.WorkerServiceType,
+						HealthCheck: &template.ContainerHealthCheck{
+							Command:     []string{"CMD-SHELL", "curl -f http://localhost/ || exit 1"},
+							Interval:    aws.Int64(5),
+							Retries:     aws.Int64(3),
+							StartPeriod: aws.Int64(0),
+							Timeout:     aws.Int64(10),
+						},
+						CustomResources: make(map[string]template.S3ObjectLocation),
+						ExecuteCommand:  &template.ExecuteCommandOpts{},
+						NestedStack: &template.WorkloadNestedStackOpts{
+							StackName:       addon.StackName,
+							VariableOutputs: []string{"MyTable"},
+						},
+						Network: template.NetworkOpts{
+							AssignPublicIP: template.DisablePublicIP,
+							SubnetsType:    template.PrivateSubnetsPlacement,
+							SecurityGroups: []template.SecurityGroup{},
+						},
+						DeploymentConfiguration: template.DeploymentConfigurationOpts{
+							MinHealthyPercent: 100,
+							MaxPercent:        200,
+							Rollback:          template.RollingUpdateRollbackConfig{MessagesDelayed: aws.Int(10)},
+						},
+						EntryPoint: []string{"enter", "from"},
+						Command:    []string{"here"},
+					}, actual)
+					return &template.Content{Buffer: bytes.NewBufferString("template")}, nil
+				})
 				svc.parser = m
 				svc.addons = mockAddons{
 					tpl: `
@@ -247,9 +210,11 @@ Outputs:
 						env:  testEnvName,
 						app:  testAppName,
 						rc: RuntimeConfig{
-							Image: &ECRImage{
-								RepoURL:  testImageRepoURL,
-								ImageTag: testImageTag,
+							PushedImages: map[string]ECRImage{
+								testServiceName: {
+									RepoURL:  testImageRepoURL,
+									ImageTag: testImageTag,
+								},
 							},
 							AccountID: "0123456789012",
 							Region:    "us-west-2",
@@ -261,8 +226,10 @@ Outputs:
 
 			if tc.setUpManifest != nil {
 				tc.setUpManifest(conf)
-				conf.manifest.Network.VPC.Placement = &testPrivatePlacement
-				conf.manifest.Network.VPC.SecurityGroups = []string{"sg-1234"}
+				conf.manifest.Network.VPC.Placement = manifest.PlacementArgOrString{
+					PlacementString: &testPrivatePlacement,
+				}
+				conf.manifest.Network.VPC.SecurityGroups = manifest.SecurityGroupsIDsOrConfig{}
 			}
 
 			tc.mockDependencies(t, ctrl, conf)
@@ -303,7 +270,9 @@ func TestWorkerService_Parameters(t *testing.T) {
 				env:  testEnvName,
 				app:  testAppName,
 				image: manifest.Image{
-					Location: aws.String("mockLocation"),
+					ImageLocationOrBuild: manifest.ImageLocationOrBuild{
+						Location: aws.String("mockLocation"),
+					},
 				},
 			},
 			tc: testWorkerSvcManifest.WorkerServiceConfig.TaskConfig,
@@ -354,6 +323,10 @@ func TestWorkerService_Parameters(t *testing.T) {
 		},
 		{
 			ParameterKey:   aws.String(WorkloadEnvFileARNParamKey),
+			ParameterValue: aws.String(""),
+		},
+		{
+			ParameterKey:   aws.String(WorkloadArtifactKeyARNParamKey),
 			ParameterValue: aws.String(""),
 		},
 	}, params)

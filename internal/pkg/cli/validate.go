@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,13 +23,16 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/addon"
 	"github.com/aws/copilot-cli/internal/pkg/aws/apprunner"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
-	"github.com/aws/copilot-cli/internal/pkg/template"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 )
+
+const basicNameRegex = `^[a-z][a-z0-9\-]+$`
+
+var errBasicNameRegexNotMatched = errors.New("value must have a length of at least 2, start with a letter, contain only lower-case letters, numbers, and hyphens, and have no consecutive or trailing hyphen")
 
 var (
 	errValueEmpty           = errors.New("value must not be empty")
 	errValueTooLong         = errors.New("value must not exceed 255 characters")
-	errValueBadFormat       = errors.New("value must start with a letter, contain only lower-case letters, numbers, and hyphens, and have no consecutive or trailing hyphen")
 	errValueNotAString      = errors.New("value must be a string")
 	errValueReserved        = errors.New("value is reserved")
 	errValueNotAStringSlice = errors.New("value must be a string slice")
@@ -60,8 +64,8 @@ var (
 	errTooManyLSIKeys                     = errors.New("number of specified LSI sort keys must be 5 or less")
 
 	// Aurora-Serverless-specific errors.
-	errInvalidRDSNameCharacters    = errors.New("value must start with a letter")
-	errRDWSNotConnectedToVPC       = fmt.Errorf("%s requires a VPC connection", manifest.RequestDrivenWebServiceType)
+	errInvalidRDSNameCharacters    = errors.New("value must start with a letter and followed by alphanumeric letters only")
+	errRDWSNotConnectedToVPC       = fmt.Errorf("%s requires a VPC connection", manifestinfo.RequestDrivenWebServiceType)
 	fmtErrInvalidEngineType        = "invalid engine type %s: must be one of %s"
 	fmtErrInvalidDBNameCharacters  = "invalid database name %s: must contain only alphanumeric characters and underscore; should start with a letter"
 	errInvalidSecretNameCharacters = errors.New("value must contain only letters, numbers, periods, hyphens and underscores")
@@ -82,7 +86,7 @@ var (
 
 // Pipelines
 const (
-	maxPipelineNameLen        = 100
+	maxPipelineStackNameLen   = 128
 	fmtErrPipelineNameTooLong = "value must not exceed %d characters"
 )
 
@@ -170,7 +174,7 @@ func reservedWorkloadNames() map[string]bool {
 	}
 }
 
-func validateAppName(val interface{}) error {
+func validateAppNameString(val interface{}) error {
 	if err := basicNameValidation(val); err != nil {
 		return fmt.Errorf("application name %v is invalid: %w", val, err)
 	}
@@ -180,7 +184,7 @@ func validateAppName(val interface{}) error {
 func validateSvcName(val interface{}, svcType string) error {
 	var err error
 	switch svcType {
-	case manifest.RequestDrivenWebServiceType:
+	case manifestinfo.RequestDrivenWebServiceType:
 		err = validateAppRunnerSvcName(val)
 	default:
 		err = basicNameValidation(val)
@@ -188,11 +192,9 @@ func validateSvcName(val interface{}, svcType string) error {
 	if err != nil {
 		return fmt.Errorf("service name %v is invalid: %w", val, err)
 	}
-
 	if err := validateNotReservedWorkloadName(val); err != nil {
 		return fmt.Errorf("service name %v is invalid: %w", val, err)
 	}
-
 	return nil
 }
 
@@ -220,7 +222,7 @@ func validateSvcType(val interface{}) error {
 	if !ok {
 		return errValueNotAString
 	}
-	return validateWorkloadType(svcType, manifest.ServiceTypes(), service)
+	return validateWorkloadType(svcType, manifestinfo.ServiceTypes(), service)
 }
 
 func validateWorkloadType(wkldType string, validTypes []string, errFlavor string) error {
@@ -238,7 +240,7 @@ func validateJobType(val interface{}) error {
 	if !ok {
 		return errValueNotAString
 	}
-	return validateWorkloadType(jobType, manifest.JobTypes(), job)
+	return validateWorkloadType(jobType, manifestinfo.JobTypes(), job)
 }
 
 func validateJobName(val interface{}) error {
@@ -252,11 +254,10 @@ func validateJobName(val interface{}) error {
 }
 
 func validatePipelineName(val interface{}, appName string) error {
-	// https://docs.aws.amazon.com/codepipeline/latest/userguide/limits.html
-
 	// compute the longest name a user can name their pipeline for this app
-	// since we prefix their name with 'pipeline-[app]-'
-	maxNameLen := maxPipelineNameLen - len(fmt.Sprintf(fmtPipelineName, appName, ""))
+	// since we prefix their name with 'pipeline-[app]-'. the limit is required
+	// because it's the name we give the cfn stack for the pipeline.
+	maxNameLen := maxPipelineStackNameLen - len(fmt.Sprintf(fmtPipelineStackName, appName, ""))
 	errFmt := "pipeline name %v is invalid: %w"
 
 	if err := basicNameValidation(val); err != nil {
@@ -335,6 +336,17 @@ func validatePath(fs afero.Fs, val interface{}) error {
 	return nil
 }
 
+func validateNonEmptyString(val interface{}) error {
+	path, ok := val.(string)
+	if !ok {
+		return errValueNotAString
+	}
+	if path == "" {
+		return errValueEmpty
+	}
+	return nil
+}
+
 type validateStorageTypeOpts struct {
 	ws           manifestReader
 	workloadName string
@@ -345,7 +357,7 @@ func validateStorageType(val interface{}, opts validateStorageTypeOpts) error {
 	if !ok {
 		return errValueNotAString
 	}
-	if !contains(storageType, storageTypes) {
+	if !slices.Contains(storageTypes, storageType) {
 		return fmt.Errorf(fmtErrInvalidStorageType, storageType, prettify(storageTypes))
 	}
 
@@ -367,7 +379,7 @@ func validateAuroraStorageType(ws manifestReader, workloadName string) error {
 	if err != nil {
 		return fmt.Errorf("invalid storage type %s: read type of workload from manifest file for %s: %w", rdsStorageType, workloadName, err)
 	}
-	if mftType != manifest.RequestDrivenWebServiceType {
+	if mftType != manifestinfo.RequestDrivenWebServiceType {
 		return nil
 	}
 	data := struct {
@@ -474,7 +486,7 @@ func basicNameValidation(val interface{}) error {
 		return errValueTooLong
 	}
 	if !isCorrectFormat(s) {
-		return errValueBadFormat
+		return errBasicNameRegexNotMatched
 	}
 
 	return nil
@@ -520,7 +532,7 @@ func validateDuration(duration string, min time.Duration) error {
 }
 
 func isCorrectFormat(s string) bool {
-	valid, err := regexp.MatchString(`^[a-z][a-z0-9\-]+$`, s)
+	valid, err := regexp.MatchString(basicNameRegex, s)
 	if err != nil {
 		return false // bubble up error?
 	}
@@ -576,12 +588,15 @@ func bytePortValidation(val []byte) error {
 }
 
 func stringPortValidation(val string) error {
-	port64, err := strconv.ParseUint(val, 10, 64)
-	if err != nil {
-		return errPortInvalid
-	}
-	if port64 < 1 || port64 > 65535 {
-		return errPortInvalid
+	portList := strings.Split(val, ",")
+	for _, port := range portList {
+		port64, err := strconv.ParseUint(port, 10, 64)
+		if err != nil {
+			return errPortInvalid
+		}
+		if port64 < 1 || port64 > 65535 {
+			return errPortInvalid
+		}
 	}
 	return nil
 }
@@ -793,7 +808,7 @@ func validatePubSubName(name string) error {
 }
 
 func prettify(inputStrings []string) string {
-	prettyTypes := template.QuoteSliceFunc(inputStrings)
+	prettyTypes := applyAll(inputStrings, strconv.Quote)
 	return strings.Join(prettyTypes, ", ")
 }
 
